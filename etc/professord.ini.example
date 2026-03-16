@@ -1,0 +1,42 @@
+# professord configuration
+
+# Model (required)
+model_path = /path/to/model.gguf
+model_alias = local-model
+
+# Context
+n_ctx = 4096
+n_gpu_layers = 99
+n_batch = 512
+
+# Sampling defaults
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+repeat_penalty = 1.1
+max_tokens = 512
+
+# Server (default: loopback only; set 0.0.0.0:8080 for LAN)
+listen_addr = 127.0.0.1:8080
+
+# Authentication (empty = no auth required)
+api_key =
+
+# IP ACL -- comma-separated list of allowed client IPs
+# Empty = allow all. When set, connections from unlisted IPs are
+# dropped silently at TCP level (no HTTP response).
+# allow_ip = 192.168.1.50, 127.0.0.1
+
+# Timeouts
+max_inference_seconds = 300
+
+# Stats reporting interval in seconds (0 = disable periodic logging)
+stats_interval = 60
+
+# Daemon (0 = foreground, 1 = double-fork; logs switch to syslog)
+daemonize = 0
+pid_file = /run/professord/professord.pid
+
+# Logging (0=TRACE 1=DEBUG 2=INFO 3=WARN 4=ERROR 5=FATAL)
+log_level = 2
+log_file =

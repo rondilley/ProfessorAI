@@ -1,0 +1,35 @@
+[Unit]
+Description=professord LLM inference daemon
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/professord --config /etc/professord.ini
+Restart=on-failure
+RestartSec=5
+WatchdogSec=600
+User=professord
+Group=professord
+SupplementaryGroups=video render
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+
+# Runtime directory for PID file
+RuntimeDirectory=professord
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
