@@ -228,6 +228,8 @@ static void detect_npu(hw_info_t *hw)
     }
 }
 
+#define GB (1024LL * 1024 * 1024)
+
 /* --- Public API --- */
 
 int hw_detect(hw_info_t *hw)
@@ -244,7 +246,7 @@ int hw_detect(hw_info_t *hw)
 
     /* GPU name from CPU model string (APU) or sysfs product name */
     if (hw->gpu_name[0] == '\0' || strcmp(hw->gpu_name, "Not detected") == 0) {
-        char product_path[512];
+        char product_path[576];
         char card_path[512];
         if (find_gpu_drm_card(card_path, sizeof(card_path)) == 0) {
             snprintf(product_path, sizeof(product_path),
@@ -253,7 +255,7 @@ int hw_detect(hw_info_t *hw)
         }
     }
 
-    /* Infer arch and marketing name from CPU model for known APUs */
+    /* Infer arch, marketing name, and memory bandwidth from CPU model */
     if (hw->gpu_arch[0] == '\0') {
         if (strstr(hw->cpu_model, "Ryzen AI MAX") != NULL ||
             strstr(hw->cpu_model, "RYZEN AI MAX") != NULL) {
@@ -262,6 +264,9 @@ int hw_detect(hw_info_t *hw)
                          "Integrated RDNA 3.5 APU");
             }
             snprintf(hw->gpu_arch, sizeof(hw->gpu_arch), "gfx1151");
+            /* Ryzen AI MAX: 8-channel LPDDR5X-7500, ~240 GB/s peak
+               Effective bandwidth ~80% due to shared bus = ~192 GB/s */
+            hw->mem_bandwidth_gbps = 192;
         } else if (strstr(hw->cpu_model, "Ryzen AI") != NULL ||
                    strstr(hw->cpu_model, "RYZEN AI") != NULL) {
             if (hw->gpu_name[0] == '\0') {
@@ -269,15 +274,31 @@ int hw_detect(hw_info_t *hw)
                          "Integrated RDNA 3.5 APU");
             }
             snprintf(hw->gpu_arch, sizeof(hw->gpu_arch), "gfx1150");
+            /* Ryzen AI 300: 4-channel LPDDR5X-7500, ~120 GB/s peak */
+            hw->mem_bandwidth_gbps = 96;
         } else if (hw->vram_bytes > 0 && hw->gpu_name[0] == '\0') {
             snprintf(hw->gpu_name, sizeof(hw->gpu_name), "AMD GPU");
         }
     }
 
+    /* Estimate bandwidth for known discrete GPUs by VRAM size heuristic */
+    if (hw->mem_bandwidth_gbps == 0 && !hw->is_uma && hw->vram_bytes > 0) {
+        int64_t vram_gb = hw->vram_bytes / GB;
+        if (vram_gb >= 80) {
+            hw->mem_bandwidth_gbps = 2000; /* MI300X class */
+        } else if (vram_gb >= 48) {
+            hw->mem_bandwidth_gbps = 800;  /* MI250 / A6000 class */
+        } else if (vram_gb >= 24) {
+            hw->mem_bandwidth_gbps = 600;  /* 7900 XTX / 4090 class */
+        } else if (vram_gb >= 16) {
+            hw->mem_bandwidth_gbps = 400;  /* 7800 XT / 4080 class */
+        } else if (vram_gb >= 8) {
+            hw->mem_bandwidth_gbps = 250;  /* midrange */
+        }
+    }
+
     return 0;
 }
-
-#define GB (1024LL * 1024 * 1024)
 
 void hw_print_summary(const hw_info_t *hw)
 {
@@ -313,6 +334,11 @@ void hw_print_summary(const hw_info_t *hw)
                (double)hw->effective_gpu_mem / GB);
     }
 
+    if (hw->mem_bandwidth_gbps > 0) {
+        printf("  Memory bandwidth: ~%lld GB/s (estimated effective)\n",
+               (long long)hw->mem_bandwidth_gbps);
+    }
+
     if (hw->has_npu) {
         printf("  NPU:          %s (not used by llama.cpp)\n", hw->npu_name);
     }
@@ -327,42 +353,61 @@ typedef struct {
     const char *quant;
     double      size_gb;
     const char *notes;
-    int         chat;      /* 1 = instruction-tuned with chat template */
 } model_entry_t;
 
 static const model_entry_t hermes_models[] = {
-    { "Hermes-3-Llama-3.1-8B",  "Q4_K_M",  4.9, "Fast, good quality",          1 },
-    { "Hermes-3-Llama-3.1-8B",  "Q6_K",    6.6, "Higher quality",              1 },
-    { "Hermes-3-Llama-3.1-8B",  "Q8_0",    8.5, "Near-lossless 8B",            1 },
-    { "Hermes-3-Llama-3.1-8B",  "F16",    16.0, "Full precision 8B",           1 },
-    { "Hermes-3-Llama-3.1-70B", "Q3_K_M", 33.0, "Aggressive quant, usable",   1 },
-    { "Hermes-3-Llama-3.1-70B", "Q4_K_M", 40.0, "Best balance for 70B",       1 },
-    { "Hermes-3-Llama-3.1-70B", "Q5_K_M", 50.0, "High quality 70B",           1 },
-    { "Hermes-3-Llama-3.1-70B", "Q6_K",   58.0, "Very high quality 70B",      1 },
-    { "Hermes-3-Llama-3.1-70B", "Q8_0",   74.0, "Near-lossless 70B",          1 },
-    { NULL, NULL, 0, NULL, 0 }
+    { "Hermes-3-Llama-3.1-8B",  "Q4_K_M",  4.9, "Fast, good quality"        },
+    { "Hermes-3-Llama-3.1-8B",  "Q6_K",    6.6, "Higher quality"            },
+    { "Hermes-3-Llama-3.1-8B",  "Q8_0",    8.5, "Near-lossless 8B"          },
+    { "Hermes-3-Llama-3.1-8B",  "F16",    16.0, "Full precision 8B"         },
+    { "Hermes-3-Llama-3.1-70B", "Q3_K_M", 33.0, "Aggressive quant, usable" },
+    { "Hermes-3-Llama-3.1-70B", "Q4_K_M", 40.0, "Best balance for 70B"     },
+    { "Hermes-3-Llama-3.1-70B", "Q5_K_M", 50.0, "High quality 70B"         },
+    { "Hermes-3-Llama-3.1-70B", "Q6_K",   58.0, "Very high quality 70B"    },
+    { "Hermes-3-Llama-3.1-70B", "Q8_0",   74.0, "Near-lossless 70B"        },
+    { NULL, NULL, 0, NULL }
 };
 
 static const model_entry_t other_models[] = {
-    { "Qwen2.5-72B-Instruct",     "Q4_K_M", 42.0, "Strong multilingual",       1 },
-    { "Qwen2.5-32B-Instruct",     "Q6_K",   25.0, "Good mid-size option",      1 },
-    { "Qwen2.5-14B-Instruct",     "Q8_0",   15.0, "Fast and capable",          1 },
-    { "Llama-3.3-70B-Instruct",   "Q4_K_M", 40.0, "Meta's latest 70B",        1 },
-    { "Mistral-Large-2411",        "Q4_K_M", 38.0, "Strong reasoning",          1 },
-    { "DeepSeek-R1-Distill-70B",  "Q4_K_M", 40.0, "Reasoning focused",        1 },
-    { "Phi-4-14B",                 "Q8_0",   15.0, "Microsoft, fast",           1 },
-    { NULL, NULL, 0, NULL, 0 }
+    { "Qwen2.5-72B-Instruct",     "Q4_K_M", 42.0, "Strong multilingual"  },
+    { "Qwen2.5-32B-Instruct",     "Q6_K",   25.0, "Good mid-size option" },
+    { "Qwen2.5-14B-Instruct",     "Q8_0",   15.0, "Fast and capable"     },
+    { "Llama-3.3-70B-Instruct",   "Q4_K_M", 40.0, "Meta's latest 70B"   },
+    { "Mistral-Large-2411",        "Q4_K_M", 38.0, "Strong reasoning"    },
+    { "DeepSeek-R1-Distill-70B",  "Q4_K_M", 40.0, "Reasoning focused"   },
+    { "Phi-4-14B",                 "Q8_0",   15.0, "Microsoft, fast"     },
+    { NULL, NULL, 0, NULL }
 };
 
-static void print_model_table(const model_entry_t *models, int64_t budget_gb,
-                               const char *header)
+/* Estimate tok/s for a model given memory bandwidth.
+   LLM token generation is memory-bandwidth bound: each token
+   requires reading the full model weights once.
+   Effective utilization is ~80% of theoretical bandwidth. */
+static double estimate_tps(double model_size_gb, int64_t bw_gbps)
 {
+    if (bw_gbps <= 0 || model_size_gb <= 0.0) return 0.0;
+    return (double)bw_gbps * 0.80 / model_size_gb;
+}
+
+static void print_model_table(const model_entry_t *models, int64_t budget_gb,
+                               int64_t bw_gbps, const char *header)
+{
+    int show_tps = (bw_gbps > 0);
+
     printf("%s\n", header);
-    printf("  %-35s %-8s %6s  %-5s  %s\n",
-           "Model", "Quant", "Size", "Fit", "Notes");
-    printf("  %-35s %-8s %6s  %-5s  %s\n",
-           "-----------------------------------", "--------", "------",
-           "-----", "------------------------------");
+    if (show_tps) {
+        printf("  %-35s %-8s %6s  %-5s  %8s  %s\n",
+               "Model", "Quant", "Size", "Fit", "~tok/s", "Notes");
+        printf("  %-35s %-8s %6s  %-5s  %8s  %s\n",
+               "-----------------------------------", "--------", "------",
+               "-----", "--------", "------------------------------");
+    } else {
+        printf("  %-35s %-8s %6s  %-5s  %s\n",
+               "Model", "Quant", "Size", "Fit", "Notes");
+        printf("  %-35s %-8s %6s  %-5s  %s\n",
+               "-----------------------------------", "--------", "------",
+               "-----", "------------------------------");
+    }
 
     for (const model_entry_t *m = models; m->name != NULL; m++) {
         const char *fit;
@@ -385,11 +430,29 @@ static void print_model_table(const model_entry_t *models, int64_t budget_gb,
             fit_marker = ' ';
         }
 
-        printf("  %c %-34s %-8s %5.0f GB  %-5s  %s\n",
-               fit_marker, m->name, m->quant, m->size_gb, fit, m->notes);
+        if (show_tps) {
+            double tps = estimate_tps(m->size_gb, bw_gbps);
+            char tps_str[16];
+            if (m->size_gb <= (double)budget_gb) {
+                snprintf(tps_str, sizeof(tps_str), "~%.1f", tps);
+            } else {
+                snprintf(tps_str, sizeof(tps_str), "< %.1f", tps * 0.3);
+            }
+            printf("  %c %-34s %-8s %5.0f GB  %-5s  %8s  %s\n",
+                   fit_marker, m->name, m->quant, m->size_gb, fit,
+                   tps_str, m->notes);
+        } else {
+            printf("  %c %-34s %-8s %5.0f GB  %-5s  %s\n",
+                   fit_marker, m->name, m->quant, m->size_gb, fit, m->notes);
+        }
     }
     printf("\n");
-    printf("  * = recommended for your hardware\n\n");
+    printf("  * = recommended for your hardware\n");
+    if (show_tps) {
+        printf("  tok/s estimates assume full GPU offload (model fits in GPU memory)\n");
+        printf("  Models marked 'Spill' run partially on CPU and are much slower\n");
+    }
+    printf("\n");
 }
 
 void hw_print_recommendations(const hw_info_t *hw)
@@ -416,9 +479,15 @@ void hw_print_recommendations(const hw_info_t *hw)
     printf("  Model size budget: ~%lld GB (reserving headroom for KV cache)\n\n",
            (long long)model_budget_gb);
 
-    print_model_table(hermes_models, model_budget_gb,
+    if (hw->mem_bandwidth_gbps > 0) {
+        printf("  Memory bandwidth: ~%lld GB/s (estimated effective)\n",
+               (long long)hw->mem_bandwidth_gbps);
+    }
+    printf("\n");
+
+    print_model_table(hermes_models, model_budget_gb, hw->mem_bandwidth_gbps,
                       "  Hermes Models (NousResearch):");
-    print_model_table(other_models, model_budget_gb,
+    print_model_table(other_models, model_budget_gb, hw->mem_bandwidth_gbps,
                       "  Other Recommended Models:");
 
     /* Top pick */
@@ -437,6 +506,10 @@ void hw_print_recommendations(const hw_info_t *hw)
 
     printf("  === Top Pick ===\n\n");
     printf("  %s %s (%.0f GB)\n", best->name, best->quant, best->size_gb);
+    if (hw->mem_bandwidth_gbps > 0) {
+        double tps = estimate_tps(best->size_gb, hw->mem_bandwidth_gbps);
+        printf("  Expected throughput: ~%.1f tok/s\n", tps);
+    }
     printf("  Best balance of quality and speed for your hardware.\n\n");
 
     printf("  Download from Hugging Face:\n");
@@ -454,5 +527,23 @@ void hw_print_recommendations(const hw_info_t *hw)
         printf("  Note: NPU detected (%s) but llama.cpp does not currently\n",
                hw->npu_name);
         printf("  support AMD XDNA/NPU acceleration. GPU is used instead.\n\n");
+    }
+
+    if (hw->mem_bandwidth_gbps > 0) {
+        printf("  === Performance Notes ===\n\n");
+        printf("  LLM token generation is memory-bandwidth bound. Each token\n");
+        printf("  requires reading the full model weights from memory once.\n\n");
+        printf("  Formula: tok/s ~ memory_bandwidth / model_size\n");
+        printf("  Your bandwidth: ~%lld GB/s -> ", (long long)hw->mem_bandwidth_gbps);
+        printf("larger model = slower, smaller model = faster\n\n");
+        printf("  To increase tok/s:\n");
+        printf("    - Use a smaller quantization (Q3_K_M < Q4_K_M < Q6_K < Q8_0)\n");
+        printf("    - Use a smaller model (8B >> 14B >> 32B >> 70B)\n");
+        printf("    - Ensure model fits fully in GPU memory (avoid CPU spill)\n\n");
+        if (hw->is_uma) {
+            printf("  UMA/APU note: GPU shares memory bandwidth with CPU.\n");
+            printf("  Actual throughput may be 10-20%% lower than estimates\n");
+            printf("  when CPU is also active.\n\n");
+        }
     }
 }

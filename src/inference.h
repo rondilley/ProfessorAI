@@ -31,6 +31,8 @@ typedef struct {
     float   presence_penalty;
     int32_t max_tokens;
     int32_t max_inference_seconds;
+    char    stop[PROF_STOP_MAX][PROF_STOP_LEN];
+    int32_t n_stop;
 } sample_params_t;
 
 typedef struct {

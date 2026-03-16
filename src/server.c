@@ -78,15 +78,18 @@ static int check_auth(struct mg_http_message *hm, const config_t *cfg)
     char expected[PROF_KEY_MAX + 8];
     snprintf(expected, sizeof(expected), "Bearer %s", cfg->api_key);
 
-    /* Constant-time-ish comparison */
+    /* Constant-time comparison -- always compare full expected length
+       to avoid leaking key length via timing */
     size_t elen = strlen(expected);
-    if (auth->len != elen) {
-        return -1;
-    }
-
-    volatile int diff = 0;
-    for (size_t i = 0; i < elen; i++) {
+    volatile int diff = (auth->len != elen) ? 1 : 0;
+    size_t cmp_len = (auth->len < elen) ? auth->len : elen;
+    for (size_t i = 0; i < cmp_len; i++) {
         diff |= (unsigned char)auth->buf[i] ^ (unsigned char)expected[i];
+    }
+    /* If lengths differ, diff is already non-zero; pad the loop
+       to always run elen iterations for consistent timing */
+    for (size_t i = cmp_len; i < elen; i++) {
+        diff |= (unsigned char)expected[i];
     }
 
     return diff ? -1 : 0;
@@ -127,6 +130,8 @@ static void handle_stats(struct mg_connection *c, server_ctx_t *sctx)
     if (json) {
         send_json_response(c, 200, json);
         free(json);
+    } else {
+        send_error(c, 500, "Internal error", "backend_error");
     }
 }
 
@@ -255,14 +260,15 @@ static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx)
 
     if (!job->stream) {
         /* Non-streaming: check if job is done */
-        if (job->state == JOB_STATE_DONE || job->state == JOB_STATE_ERROR) {
+        int jstate = atomic_load(&job->state);
+        if (jstate == JOB_STATE_DONE || jstate == JOB_STATE_ERROR) {
             int64_t latency = now_ms() - cd->start_time_ms;
 
-            if (job->state == JOB_STATE_ERROR &&
+            if (jstate == JOB_STATE_ERROR &&
                 strcmp(job->finish_reason, "context_overflow") == 0) {
                 send_error(c, 400, "Prompt too long for context window",
                            "invalid_request");
-            } else if (job->state == JOB_STATE_ERROR) {
+            } else if (jstate == JOB_STATE_ERROR) {
                 send_error(c, 500, "Inference failed", "backend_error");
             } else if (job->type == JOB_CHAT) {
                 chat_response_t resp;
@@ -278,12 +284,14 @@ static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx)
                          "%s", job->finish_reason);
                 resp.usage.prompt_tokens     = job->prompt_tokens;
                 resp.usage.completion_tokens = job->completion_tokens;
-                resp.usage.total_tokens      = job->prompt_tokens + job->completion_tokens;
+                resp.usage.total_tokens      = (int32_t)((int64_t)job->prompt_tokens + job->completion_tokens);
 
                 char *json = chat_response_to_json(&resp);
                 if (json) {
                     send_json_response(c, 200, json);
                     free(json);
+                } else {
+                    send_error(c, 500, "Internal error", "backend_error");
                 }
             } else {
                 completion_response_t resp;
@@ -299,17 +307,19 @@ static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx)
                          "%s", job->finish_reason);
                 resp.usage.prompt_tokens     = job->prompt_tokens;
                 resp.usage.completion_tokens = job->completion_tokens;
-                resp.usage.total_tokens      = job->prompt_tokens + job->completion_tokens;
+                resp.usage.total_tokens      = (int32_t)((int64_t)job->prompt_tokens + job->completion_tokens);
 
                 char *json = completion_response_to_json(&resp);
                 if (json) {
                     send_json_response(c, 200, json);
                     free(json);
+                } else {
+                    send_error(c, 500, "Internal error", "backend_error");
                 }
             }
 
             log_access(sctx->lg, c, cd->method, cd->path,
-                       (job->state == JOB_STATE_DONE) ? 200 : 500,
+                       (jstate == JOB_STATE_DONE) ? 200 : 500,
                        latency, job->prompt_tokens, job->completion_tokens);
 
             /* Track inference stats */
@@ -329,22 +339,55 @@ static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx)
         return;
     }
 
-    /* Streaming: drain ring buffer */
-    char token_text[TOKEN_TEXT_MAX];
-    while (ring_read(&job->ring, token_text, sizeof(token_text))) {
-        stream_chunk_t chunk;
-        memset(&chunk, 0, sizeof(chunk));
-        snprintf(chunk.id, sizeof(chunk.id), "%s", job->request_id);
-        snprintf(chunk.model, sizeof(chunk.model), "%s", job->model_id);
-        chunk.created = (int64_t)time(NULL);
-        snprintf(chunk.delta_content, sizeof(chunk.delta_content), "%s", token_text);
-        chunk.is_chat = (job->type == JOB_CHAT);
+    /* Streaming: batch-drain ring buffer under a single lock */
+    {
+        char batch_tokens[32][TOKEN_TEXT_MAX];
+        int batch_count;
+        int64_t created = (int64_t)time(NULL);
+        const char *obj_type = (job->type == JOB_CHAT)
+            ? "chat.completion.chunk" : "text_completion.chunk";
 
-        char *json = stream_chunk_to_json(&chunk);
-        if (json) {
-            mg_printf(c, "data: %s\n\n", json);
-            free(json);
-        }
+        do {
+            batch_count = 0;
+            pthread_mutex_lock(&job->ring.mutex);
+            while (!ring_is_empty_unlocked(&job->ring) && batch_count < 32) {
+                size_t tlen = strlen(job->ring.text[job->ring.tail]);
+                if (tlen >= TOKEN_TEXT_MAX) tlen = TOKEN_TEXT_MAX - 1;
+                memcpy(batch_tokens[batch_count], job->ring.text[job->ring.tail], tlen);
+                batch_tokens[batch_count][tlen] = '\0';
+                job->ring.tail = (job->ring.tail + 1) % TOKEN_RING_SIZE;
+                batch_count++;
+            }
+            if (batch_count > 0) {
+                pthread_cond_signal(&job->ring.not_full);
+            }
+            pthread_mutex_unlock(&job->ring.mutex);
+
+            /* Format SSE chunks directly without cJSON */
+            for (int bi = 0; bi < batch_count; bi++) {
+                if (job->type == JOB_CHAT) {
+                    mg_printf(c,
+                        "data: {\"id\":\"%s\",\"object\":\"%s\","
+                        "\"created\":%lld,\"model\":\"%s\","
+                        "\"choices\":[{\"index\":0,"
+                        "\"delta\":{\"content\":\"%M\"},"
+                        "\"finish_reason\":null}]}\n\n",
+                        job->request_id, obj_type,
+                        (long long)created, job->model_id,
+                        MG_ESC(batch_tokens[bi]));
+                } else {
+                    mg_printf(c,
+                        "data: {\"id\":\"%s\",\"object\":\"%s\","
+                        "\"created\":%lld,\"model\":\"%s\","
+                        "\"choices\":[{\"index\":0,"
+                        "\"text\":\"%M\","
+                        "\"finish_reason\":null}]}\n\n",
+                        job->request_id, obj_type,
+                        (long long)created, job->model_id,
+                        MG_ESC(batch_tokens[bi]));
+                }
+            }
+        } while (batch_count == 32); /* keep draining if ring was full */
     }
 
     /* Check if done */
@@ -353,7 +396,8 @@ static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx)
     done = job->ring.done && ring_is_empty_unlocked(&job->ring);
     pthread_mutex_unlock(&job->ring.mutex);
 
-    if (done || job->state == JOB_STATE_DONE || job->state == JOB_STATE_ERROR) {
+    int sstate = atomic_load(&job->state);
+    if (done || sstate == JOB_STATE_DONE || sstate == JOB_STATE_ERROR) {
         /* Send final chunk with finish_reason */
         stream_chunk_t final_chunk;
         memset(&final_chunk, 0, sizeof(final_chunk));
@@ -483,9 +527,19 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
             char ip[48];
             mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
 
+            /* Strip ::ffff: prefix to normalize IPv4-mapped IPv6 addresses */
+            const char *norm_ip = ip;
+            if (strncmp(ip, "::ffff:", 7) == 0) {
+                norm_ip = ip + 7;
+            }
+
             int allowed = 0;
             for (int i = 0; i < sctx->cfg->acl_count; i++) {
-                if (strcmp(ip, sctx->cfg->acl[i]) == 0) {
+                const char *acl_ip = sctx->cfg->acl[i];
+                if (strncmp(acl_ip, "::ffff:", 7) == 0) {
+                    acl_ip = acl_ip + 7;
+                }
+                if (strcmp(norm_ip, acl_ip) == 0) {
                     allowed = 1;
                     break;
                 }
@@ -522,14 +576,22 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
         conn_data_t *cd = (conn_data_t *)c->fn_data;
         if (cd && cd->job) {
             cd->job->cancel = 1;
-            /* Don't free here -- worker thread may still be using the job.
-               It will be freed when the wakeup handler sees the done state. */
+            /* Mark the job as orphaned so the worker thread frees it
+               when inference completes. Clear mgr to prevent wakeup
+               attempts on the now-dead connection. */
+            cd->job->mgr = NULL;
+            cd->job->orphaned = 1;
+            free(cd);
+            c->fn_data = NULL;
         }
     }
 }
 
 int server_init(struct mg_mgr *mgr, server_ctx_t *sctx)
 {
+    /* Suppress mongoose debug noise -- only show errors */
+    mg_log_set(MG_LL_ERROR);
+
     mg_mgr_init(mgr);
     mg_wakeup_init(mgr);
     mgr->userdata = sctx;

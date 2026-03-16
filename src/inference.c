@@ -8,11 +8,55 @@
 #include "inference.h"
 #include "daemon.h"
 
+#include <ggml.h>
 #include <llama.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+/* Global logger pointer for the llama.cpp log callback.
+   Only one llama context exists per process, so this is safe. */
+static logger_t *s_llama_logger = NULL;
+
+static void llama_log_cb(enum ggml_log_level level, const char *text, void *user_data)
+{
+    (void)user_data;
+    if (!s_llama_logger) return;
+
+    /* Strip trailing newline from llama.cpp messages */
+    size_t len = strlen(text);
+    char buf[2048];
+    if (len > 0 && len < sizeof(buf)) {
+        memcpy(buf, text, len);
+        if (buf[len - 1] == '\n') buf[len - 1] = '\0';
+        else buf[len] = '\0';
+    } else {
+        buf[0] = '\0';
+    }
+    if (buf[0] == '\0') return;
+
+    /* Map ggml log levels to our logger levels */
+    switch (level) {
+        case GGML_LOG_LEVEL_DEBUG:
+            LOG_DEBUG(s_llama_logger, "[llama] %s", buf);
+            break;
+        case GGML_LOG_LEVEL_INFO:
+        case GGML_LOG_LEVEL_CONT:
+            LOG_INFO(s_llama_logger, "[llama] %s", buf);
+            break;
+        case GGML_LOG_LEVEL_WARN:
+            LOG_WARN(s_llama_logger, "[llama] %s", buf);
+            break;
+        case GGML_LOG_LEVEL_ERROR:
+            LOG_ERROR(s_llama_logger, "[llama] %s", buf);
+            break;
+        default:
+            LOG_DEBUG(s_llama_logger, "[llama] %s", buf);
+            break;
+    }
+}
 
 /* Manual ChatML prompt builder (used when model has no template or
    llama_chat_apply_template returns empty) */
@@ -77,6 +121,10 @@ int inference_init(inference_engine_t *eng, const config_t *cfg, logger_t *lg)
     memset(eng, 0, sizeof(*eng));
     eng->logger = lg;
 
+    /* Route llama.cpp logs through our logger so they respect log-level */
+    s_llama_logger = lg;
+    llama_log_set(llama_log_cb, NULL);
+
     llama_backend_init();
 
     LOG_INFO(lg, "loading model: %s", cfg->model_path);
@@ -93,9 +141,22 @@ int inference_init(inference_engine_t *eng, const config_t *cfg, logger_t *lg)
 
     eng->vocab = llama_model_get_vocab(eng->model);
 
+    /* Detect thread count: 0 = auto (use half of available cores) */
+    int32_t n_threads = cfg->n_threads;
+    if (n_threads <= 0) {
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        n_threads = (nproc > 0) ? (int32_t)(nproc / 2) : 4;
+        if (n_threads < 1) n_threads = 1;
+    }
+
     struct llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = (uint32_t)cfg->n_ctx;
-    cparams.n_batch = (uint32_t)cfg->n_batch;
+    cparams.n_ctx           = (uint32_t)cfg->n_ctx;
+    cparams.n_batch         = (uint32_t)cfg->n_batch;
+    cparams.n_threads       = n_threads;
+    cparams.n_threads_batch = n_threads;
+    cparams.type_k          = GGML_TYPE_Q8_0;  /* quantize KV cache to reduce memory bandwidth */
+    cparams.type_v          = GGML_TYPE_Q8_0;
+    cparams.no_perf         = false;
 
     eng->ctx = llama_init_from_model(eng->model, cparams);
     if (!eng->ctx) {
@@ -120,8 +181,11 @@ int inference_init(inference_engine_t *eng, const config_t *cfg, logger_t *lg)
         LOG_WARN(lg, "model has no chat template, using ChatML fallback");
     }
 
-    LOG_INFO(lg, "model loaded: n_ctx=%d, n_gpu_layers=%d",
-             cfg->n_ctx, cfg->n_gpu_layers);
+    LOG_INFO(lg, "model loaded: n_ctx=%d, n_gpu_layers=%d, n_batch=%d, n_threads=%d",
+             cfg->n_ctx, cfg->n_gpu_layers, cfg->n_batch, n_threads);
+
+    /* Dump per-device memory breakdown so we can verify full GPU offload */
+    llama_memory_breakdown_print(eng->ctx);
 
     return 0;
 }
@@ -219,6 +283,10 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
     /* Build sampler chain */
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *chain = llama_sampler_chain_init(sparams);
+    if (!chain) {
+        snprintf(finish_reason, fr_len, "%s", "backend_error");
+        return -1;
+    }
 
     if (params->temperature <= 0.0f) {
         /* Greedy */
@@ -251,6 +319,12 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
     int stop_window_len = 0;
     memset(stop_window, 0, sizeof(stop_window));
 
+    /* Pre-compute stop sequence lengths to avoid strlen per token */
+    int stop_lens[PROF_STOP_MAX];
+    for (int si = 0; si < params->n_stop && si < PROF_STOP_MAX; si++) {
+        stop_lens[si] = (int)strlen(params->stop[si]);
+    }
+
     int32_t n_generated = 0;
 
     for (int32_t i = 0; i < max_gen; i++) {
@@ -263,7 +337,9 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
             snprintf(finish_reason, fr_len, "%s", "abort");
             break;
         }
-        if (elapsed_seconds(&start_time) > (double)params->max_inference_seconds) {
+        /* Check timeout every 32 tokens to reduce vDSO overhead */
+        if ((i & 31) == 0 &&
+            elapsed_seconds(&start_time) > (double)params->max_inference_seconds) {
             snprintf(finish_reason, fr_len, "%s", "time_limit");
             break;
         }
@@ -290,32 +366,38 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
         n_generated++;
 
         /* Stop sequence check (rolling window) */
-        int stop_matched = 0;
-        if (params->max_tokens > 0) { /* only if we have stop seqs via the request */
-            /* Append to rolling window */
+        if (params->n_stop > 0) {
+            /* Clamp piece to window capacity */
             int plen = piece_len;
-            if (stop_window_len + plen >= (int)sizeof(stop_window)) {
-                /* Shift window */
-                int shift = stop_window_len + plen - (int)sizeof(stop_window) + 1;
-                if (shift > 0 && shift < stop_window_len) {
+            int max_window = (int)sizeof(stop_window) - 1;
+            if (plen > max_window) {
+                /* Piece alone exceeds window; keep only the tail */
+                stop_window_len = 0;
+                plen = max_window;
+                memcpy(stop_window, piece + piece_len - plen, (size_t)plen);
+            } else {
+                if (stop_window_len + plen > max_window) {
+                    /* Shift window to make room */
+                    int shift = stop_window_len + plen - max_window;
                     memmove(stop_window, stop_window + shift,
                             (size_t)(stop_window_len - shift));
                     stop_window_len -= shift;
-                } else {
-                    stop_window_len = 0;
                 }
+                memcpy(stop_window + stop_window_len, piece, (size_t)plen);
             }
-            memcpy(stop_window + stop_window_len, piece, (size_t)plen);
             stop_window_len += plen;
             stop_window[stop_window_len] = '\0';
 
-            /* Check each stop sequence as suffix */
-            /* Note: stop sequences come from the chat_request, not sample_params.
-               We check them here via a simple pattern -- the caller passes stop
-               sequences through the user_data or we'd need to thread them through.
-               For now, stop sequences are not checked here -- they are checked in
-               the worker layer which has access to the request. */
-            (void)stop_matched;
+            /* Check each stop sequence as suffix of the window */
+            for (int si = 0; si < params->n_stop; si++) {
+                int slen = stop_lens[si];
+                if (slen > 0 && slen <= stop_window_len &&
+                    memcmp(stop_window + stop_window_len - slen,
+                           params->stop[si], (size_t)slen) == 0) {
+                    snprintf(finish_reason, fr_len, "%s", "stop");
+                    goto generation_done;
+                }
+            }
         }
 
         /* Callback */
@@ -337,7 +419,23 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
         }
     }
 
+generation_done:
     *out_completion_tokens = n_generated;
+
+    /* Log llama.cpp internal performance counters */
+    {
+        struct llama_perf_context_data perf = llama_perf_context(eng->ctx);
+        LOG_INFO(eng->logger,
+            "llama perf: prompt=%.1fms (%.1f tok/s), "
+            "eval=%.1fms (%.1f tok/s), "
+            "n_p_eval=%d, n_eval=%d",
+            perf.t_p_eval_ms,
+            perf.n_p_eval > 0 ? 1e3 * perf.n_p_eval / perf.t_p_eval_ms : 0.0,
+            perf.t_eval_ms,
+            perf.n_eval > 0 ? 1e3 * perf.n_eval / perf.t_eval_ms : 0.0,
+            perf.n_p_eval, perf.n_eval);
+    }
+    llama_perf_context_reset(eng->ctx);
 
     llama_sampler_free(chain);
 
@@ -422,7 +520,7 @@ int inference_chat(inference_engine_t *eng,
 
             free(chat_msgs);
 
-            if (actual <= 0) {
+            if (actual <= 0 || actual > needed) {
                 LOG_ERROR(eng->logger, "llama_chat_apply_template render failed");
                 free(formatted);
                 snprintf(finish_reason, fr_len, "%s", "backend_error");
@@ -462,6 +560,10 @@ sample_params_t inference_resolve_params(const config_t *cfg,
     p.max_tokens = (req->max_tokens == -1) ? cfg->max_tokens
                    : clamp_i(req->max_tokens, 1, cfg->n_ctx);
     p.max_inference_seconds = cfg->max_inference_seconds;
+    p.n_stop = req->stop_count;
+    for (int32_t si = 0; si < req->stop_count && si < PROF_STOP_MAX; si++) {
+        snprintf(p.stop[si], PROF_STOP_LEN, "%s", req->stop[si]);
+    }
 
     return p;
 }
@@ -484,6 +586,10 @@ sample_params_t inference_resolve_params_completion(const config_t *cfg,
     p.max_tokens = (req->max_tokens == -1) ? cfg->max_tokens
                    : clamp_i(req->max_tokens, 1, cfg->n_ctx);
     p.max_inference_seconds = cfg->max_inference_seconds;
+    p.n_stop = req->stop_count;
+    for (int32_t si = 0; si < req->stop_count && si < PROF_STOP_MAX; si++) {
+        snprintf(p.stop[si], PROF_STOP_LEN, "%s", req->stop[si]);
+    }
 
     return p;
 }

@@ -14,7 +14,7 @@ Designed for a single-GPU host (AMD ROCm) serving one primary client (Hermes on 
 - Admission control (503 when busy)
 - Per-token cancellation on disconnect, shutdown, or timeout
 - Runtime stats endpoint (`/v1/stats`) and periodic log reporting
-- Hardware detection and model recommendations (`--recommend`)
+- Hardware detection and model recommendations with estimated tok/s (`--recommend`)
 - INI config file + CLI argument overrides
 - Optional daemonization with syslog logging
 - systemd `Type=notify` with readiness signaling
@@ -71,7 +71,8 @@ See [etc/professord.ini.example](etc/professord.ini.example) for all options.
 | `--model-alias NAME` | `local-model` | Model name reported in API responses |
 | `--n-ctx N` | 4096 | Context window size (tokens) |
 | `--n-gpu-layers N` | 99 | Layers to offload to GPU |
-| `--n-batch N` | 512 | Batch size for prompt processing |
+| `--n-batch N` | 2048 | Batch size for prompt processing |
+| `--n-threads N` | 0 (auto) | CPU threads for generation (0 = nproc/2) |
 | `--temperature F` | 0.7 | Sampling temperature (0 = greedy) |
 | `--top-p F` | 0.9 | Nucleus sampling threshold |
 | `--top-k N` | 40 | Top-k sampling |
@@ -270,6 +271,8 @@ journalctl -t professord -f | grep stats
 | Authentication | Pre-shared Bearer token (`api_key`) |
 | OS firewall | iptables/nftables/ufw as defense in depth |
 | Transport | Plaintext HTTP (acceptable on trusted LAN) |
+| Auth timing | Constant-time key comparison (prevents length/content leaking) |
+| ACL normalization | IPv4-mapped IPv6 addresses normalized before comparison |
 | Admission control | 503 when busy (prevents resource exhaustion) |
 | Input validation | Body size, message count, role, and parameter limits |
 | Inference timeout | `max_inference_seconds` prevents runaway generation |
@@ -372,9 +375,37 @@ All errors return OpenAI-format JSON:
 | 503 | `server_busy` | Inference already in progress |
 | 500 | `backend_error` | llama.cpp failure |
 
+## Testing
+
+```bash
+# Unit tests (requires debug build with -DPROF_BUILD_TESTS=ON)
+ctest --test-dir build --output-on-failure
+
+# Quick integration test (requires running professord)
+bash tests/test_curl.sh [base_url] [api_key]
+
+# Full test suite: 43 tests across unit, functional, inference,
+# stress, and stability categories. Generates timestamped report.
+bash tests/test_all.sh [base_url] [api_key]
+```
+
+Reports are written to `tests/reports/report-YYYYMMDD-HHMMSS.md`.
+
+## Performance
+
+Token generation throughput is memory-bandwidth bound. Use `--recommend` to see estimated tok/s for different model sizes on your hardware.
+
+Key configuration for performance:
+- `--n-threads 0` (default) auto-detects optimal thread count
+- `--n-batch 2048` (default) for fast prompt processing
+- KV cache uses q8_0 quantization to reduce attention bandwidth
+- Flash attention enabled automatically when supported
+
+llama.cpp performance counters are logged per request at INFO level (prompt tok/s, eval tok/s).
+
 ## Architecture
 
-See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for component diagrams, data flow, threading model, and full API contract details.
+See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for component diagrams, data flow, threading model, security measures, and full API contract details.
 
 ## License
 

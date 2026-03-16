@@ -23,7 +23,8 @@ static void test_defaults(void)
     assert(strcmp(cfg.model_alias, "local-model") == 0);
     assert(cfg.n_ctx == 4096);
     assert(cfg.n_gpu_layers == 99);
-    assert(cfg.n_batch == 512);
+    assert(cfg.n_batch == 2048);
+    assert(cfg.n_threads == 0);
     assert(fabsf(cfg.temperature - 0.7f) < 0.001f);
     assert(fabsf(cfg.top_p - 0.9f) < 0.001f);
     assert(cfg.top_k == 40);

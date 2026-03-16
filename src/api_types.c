@@ -220,6 +220,7 @@ int completion_request_parse(completion_request_t *req, const char *json, size_t
 char *chat_response_to_json(const chat_response_t *resp)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON_AddStringToObject(root, "id", resp->id);
     cJSON_AddStringToObject(root, "object", "chat.completion");
     cJSON_AddNumberToObject(root, "created", (double)resp->created);
@@ -251,6 +252,7 @@ char *chat_response_to_json(const chat_response_t *resp)
 char *completion_response_to_json(const completion_response_t *resp)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON_AddStringToObject(root, "id", resp->id);
     cJSON_AddStringToObject(root, "object", "text_completion");
     cJSON_AddNumberToObject(root, "created", (double)resp->created);
@@ -277,6 +279,7 @@ char *completion_response_to_json(const completion_response_t *resp)
 char *stream_chunk_to_json(const stream_chunk_t *chunk)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON_AddStringToObject(root, "id", chunk->id);
     cJSON_AddStringToObject(root, "object",
                             chunk->is_chat ? "chat.completion.chunk" : "text_completion.chunk");
@@ -317,6 +320,7 @@ char *stream_chunk_to_json(const stream_chunk_t *chunk)
 char *models_list_to_json(const char *model_id)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON_AddStringToObject(root, "object", "list");
 
     cJSON *data = cJSON_AddArrayToObject(root, "data");
@@ -335,7 +339,9 @@ char *models_list_to_json(const char *model_id)
 char *error_to_json(int code, const char *message, const char *type)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
     cJSON *err = cJSON_CreateObject();
+    if (!err) { cJSON_Delete(root); return NULL; }
     cJSON_AddStringToObject(err, "message", message);
     cJSON_AddStringToObject(err, "type", type);
     cJSON_AddNumberToObject(err, "code", code);

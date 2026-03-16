@@ -20,7 +20,8 @@ void config_defaults(config_t *cfg)
     snprintf(cfg->model_alias, sizeof(cfg->model_alias), "%s", "local-model");
     cfg->n_ctx           = 4096;
     cfg->n_gpu_layers    = 99;
-    cfg->n_batch         = 512;
+    cfg->n_batch         = 2048;
+    cfg->n_threads       = 0;      /* 0 = auto-detect */
 
     cfg->temperature     = 0.7f;
     cfg->top_p           = 0.9f;
@@ -73,6 +74,8 @@ static void set_config_field(config_t *cfg, const char *key, const char *value)
         cfg->n_gpu_layers = (int32_t)strtol(value, NULL, 10);
     } else if (strcmp(key, "n_batch") == 0) {
         cfg->n_batch = (int32_t)strtol(value, NULL, 10);
+    } else if (strcmp(key, "n_threads") == 0) {
+        cfg->n_threads = (int32_t)strtol(value, NULL, 10);
     } else if (strcmp(key, "temperature") == 0) {
         cfg->temperature = strtof(value, NULL);
     } else if (strcmp(key, "top_p") == 0) {
@@ -192,6 +195,8 @@ int config_parse_cli(config_t *cfg, int argc, char **argv)
             cfg->n_gpu_layers = (int32_t)strtol(val, NULL, 10);
         } else if (strcmp(arg, "--n-batch") == 0) {
             cfg->n_batch = (int32_t)strtol(val, NULL, 10);
+        } else if (strcmp(arg, "--n-threads") == 0) {
+            cfg->n_threads = (int32_t)strtol(val, NULL, 10);
         } else if (strcmp(arg, "--temperature") == 0) {
             cfg->temperature = strtof(val, NULL);
         } else if (strcmp(arg, "--top-p") == 0) {
@@ -269,7 +274,8 @@ void config_print_help(const char *prog)
     printf("  --model-alias NAME         Model name in API responses [local-model]\n");
     printf("  --n-ctx N                  Context window size [4096]\n");
     printf("  --n-gpu-layers N           GPU layers to offload [99]\n");
-    printf("  --n-batch N                Batch size [512]\n");
+    printf("  --n-batch N                Batch size [2048]\n");
+    printf("  --n-threads N              CPU threads [0=auto]\n");
     printf("  --temperature F            Sampling temperature [0.7]\n");
     printf("  --top-p F                  Nucleus sampling threshold [0.9]\n");
     printf("  --top-k N                  Top-k sampling [40]\n");

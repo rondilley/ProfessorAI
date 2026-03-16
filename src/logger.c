@@ -100,7 +100,7 @@ void logger_destroy(logger_t *lg)
 void logger_log(logger_t *lg, log_level_t level, const char *file, int line,
                 const char *fmt, ...)
 {
-    if (level < lg->level) {
+    if (level < lg->level || level < LOG_TRACE || level > LOG_FATAL) {
         return;
     }
 

@@ -62,7 +62,10 @@ static int ring_write(token_ring_t *r, const char *text, volatile int *cancel)
         return -1;
     }
 
-    snprintf(r->text[r->head], TOKEN_TEXT_MAX, "%s", text);
+    size_t len = strlen(text);
+    if (len >= TOKEN_TEXT_MAX) len = TOKEN_TEXT_MAX - 1;
+    memcpy(r->text[r->head], text, len);
+    r->text[r->head][len] = '\0';
     r->head = (r->head + 1) % TOKEN_RING_SIZE;
 
     pthread_cond_signal(&r->not_empty);
@@ -92,6 +95,7 @@ static int ring_read(token_ring_t *r, char *out, size_t out_len)
 
 typedef struct {
     worker_job_t *job;
+    int           tokens_since_wake;
 } stream_cb_data_t;
 
 static int stream_token_cb(const char *token_text, void *user_data)
@@ -99,13 +103,22 @@ static int stream_token_cb(const char *token_text, void *user_data)
     stream_cb_data_t *sd = (stream_cb_data_t *)user_data;
     worker_job_t *job = sd->job;
 
+    /* Check if ring was empty before write to batch wakeups */
+    int was_empty;
+    pthread_mutex_lock(&job->ring.mutex);
+    was_empty = ring_is_empty(&job->ring);
+    pthread_mutex_unlock(&job->ring.mutex);
+
     if (ring_write(&job->ring, token_text, &job->cancel) != 0) {
         return -1; /* cancelled */
     }
 
-    /* Wake the event loop to drain the ring */
-    if (job->mgr) {
+    /* Only wake the event loop when the ring transitions from empty,
+       or every 8 tokens, to reduce per-token syscall overhead */
+    sd->tokens_since_wake++;
+    if (job->mgr && (was_empty || sd->tokens_since_wake >= 8)) {
         mg_wakeup((struct mg_mgr *)job->mgr, job->wakeup_id, NULL, 0);
+        sd->tokens_since_wake = 0;
     }
 
     return 0;
@@ -174,7 +187,7 @@ static void *worker_thread_func(void *arg)
         worker_job_t *job = w->current_job;
         pthread_mutex_unlock(&w->mutex);
 
-        job->state = JOB_STATE_RUNNING;
+        atomic_store(&job->state, JOB_STATE_RUNNING);
         int rc;
 
         if (job->stream) {
@@ -208,8 +221,9 @@ static void *worker_thread_func(void *arg)
             pthread_mutex_unlock(&job->ring.mutex);
         } else {
             /* Allocate response buffer */
-            job->response_cap = (size_t)job->params.max_tokens * 8;
-            if (job->response_cap < 1024) job->response_cap = 1024;
+            job->response_cap = (job->params.max_tokens > 0)
+                ? (size_t)job->params.max_tokens * 16 : 8192;
+            if (job->response_cap < 8192) job->response_cap = 8192;
             if (job->response_cap > PROF_CONTENT_MAX) job->response_cap = PROF_CONTENT_MAX;
             job->response_buf = malloc(job->response_cap);
             job->response_len = 0;
@@ -245,7 +259,7 @@ static void *worker_thread_func(void *arg)
             }
         }
 
-        job->state = (rc == 0) ? JOB_STATE_DONE : JOB_STATE_ERROR;
+        atomic_store(&job->state, (rc == 0) ? JOB_STATE_DONE : JOB_STATE_ERROR);
 
         LOG_INFO(w->logger, "inference done: prompt=%d comp=%d finish=%s",
                  job->prompt_tokens, job->completion_tokens, job->finish_reason);
@@ -255,8 +269,13 @@ static void *worker_thread_func(void *arg)
         w->current_job = NULL;
         pthread_mutex_unlock(&w->mutex);
 
-        /* Wake event loop for final response */
-        if (job->mgr) {
+        /* If the connection was closed during inference, free the orphaned job */
+        if (job->orphaned) {
+            LOG_INFO(w->logger, "freeing orphaned job (client disconnected)");
+            worker_job_free(job);
+            free(job);
+        } else if (job->mgr) {
+            /* Wake event loop for final response */
             mg_wakeup((struct mg_mgr *)job->mgr, job->wakeup_id, NULL, 0);
         }
     }
@@ -307,14 +326,14 @@ int worker_submit(worker_t *w, worker_job_t *job)
     pthread_mutex_lock(&w->mutex);
 
     if (w->current_job != NULL &&
-        (w->current_job->state == JOB_STATE_IDLE ||
-         w->current_job->state == JOB_STATE_RUNNING)) {
+        (atomic_load(&w->current_job->state) == JOB_STATE_IDLE ||
+         atomic_load(&w->current_job->state) == JOB_STATE_RUNNING)) {
         pthread_mutex_unlock(&w->mutex);
         return -1; /* busy */
     }
 
     w->current_job = job;
-    job->state = JOB_STATE_IDLE;
+    atomic_store(&job->state, JOB_STATE_IDLE);
     job->cancel = 0;
     pthread_cond_signal(&w->job_ready);
     pthread_mutex_unlock(&w->mutex);
@@ -327,15 +346,18 @@ int worker_is_busy(const worker_t *w)
     /* Read without lock -- acceptable for advisory check */
     worker_job_t *job = w->current_job;
     if (job == NULL) return 0;
-    return (job->state == JOB_STATE_IDLE || job->state == JOB_STATE_RUNNING);
+    int s = atomic_load(&job->state);
+    return (s == JOB_STATE_IDLE || s == JOB_STATE_RUNNING);
 }
 
 void worker_cancel(worker_t *w)
 {
+    pthread_mutex_lock(&w->mutex);
     worker_job_t *job = w->current_job;
     if (job) {
         job->cancel = 1;
     }
+    pthread_mutex_unlock(&w->mutex);
 }
 
 void worker_job_init(worker_job_t *job)

@@ -8,6 +8,7 @@
 #include "daemon.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,13 +65,14 @@ int daemon_daemonize(void)
 
     /* Redirect stdin/stdout/stderr to /dev/null */
     int devnull = open("/dev/null", O_RDWR);
-    if (devnull >= 0) {
-        dup2(devnull, STDIN_FILENO);
-        dup2(devnull, STDOUT_FILENO);
-        dup2(devnull, STDERR_FILENO);
-        if (devnull > STDERR_FILENO) {
-            close(devnull);
-        }
+    if (devnull < 0) {
+        return -1;
+    }
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO) {
+        close(devnull);
     }
 
     umask(0027);
@@ -86,7 +88,23 @@ int daemon_write_pidfile(const char *path)
     /* O_EXCL prevents symlink attacks */
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
-        /* File may exist from a previous crash -- try unlink and retry */
+        /* File exists -- check if the PID inside is still running */
+        int old_fd = open(path, O_RDONLY | O_NOFOLLOW);
+        if (old_fd < 0) {
+            return -1; /* can't read it and can't create -- bail */
+        }
+        char pidbuf[32];
+        ssize_t n = read(old_fd, pidbuf, sizeof(pidbuf) - 1);
+        close(old_fd);
+        if (n > 0) {
+            pidbuf[n] = '\0';
+            long old_pid = strtol(pidbuf, NULL, 10);
+            if (old_pid > 0 && kill((pid_t)old_pid, 0) == 0) {
+                /* Process is still running -- refuse to take over */
+                return -1;
+            }
+        }
+        /* Stale PID file from a crashed instance -- safe to replace */
         unlink(path);
         fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
         if (fd < 0) {

@@ -13,6 +13,7 @@
 #include "logger.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* Token ring buffer: worker writes, main thread reads */
@@ -57,9 +58,10 @@ typedef struct {
 
     /* Cancellation (main thread writes, worker reads) */
     volatile int         cancel;
+    volatile int         orphaned;  /* connection closed, worker must free */
 
-    /* Output (set by worker) */
-    job_state_t          state;
+    /* Output (set by worker, read by main thread) */
+    atomic_int           state;  /* job_state_t values */
     char                 finish_reason[32];
     int32_t              prompt_tokens;
     int32_t              completion_tokens;

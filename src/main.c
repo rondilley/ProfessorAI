@@ -69,12 +69,15 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 3. First CLI pass: extract --config and --help */
-    if (config_parse_cli(&cfg, argc, argv) != 0) {
-        return 1;
+    /* 3. Extract --config path before full parse */
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--config") == 0) {
+            snprintf(cfg.config_file, sizeof(cfg.config_file), "%s", argv[i + 1]);
+            break;
+        }
     }
 
-    /* 3. Load config file if specified */
+    /* 3b. Load config file if specified */
     if (cfg.config_file[0] != '\0') {
         if (config_load_file(&cfg, cfg.config_file) != 0) {
             fprintf(stderr, "Error: failed to load config: %s\n", cfg.config_file);

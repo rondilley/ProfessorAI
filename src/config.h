@@ -23,6 +23,7 @@ typedef struct {
     int32_t  n_ctx;
     int32_t  n_gpu_layers;
     int32_t  n_batch;
+    int32_t  n_threads;          /* 0 = auto-detect */
 
     /* Sampling defaults */
     float    temperature;

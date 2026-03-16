@@ -30,6 +30,7 @@ typedef struct {
 
     int      is_uma;             /* unified memory architecture */
     int64_t  effective_gpu_mem;  /* usable memory for model loading */
+    int64_t  mem_bandwidth_gbps; /* estimated memory bandwidth in GB/s, 0=unknown */
 } hw_info_t;
 
 int  hw_detect(hw_info_t *hw);

@@ -1,7 +1,7 @@
-# Professor_AI Architecture (v2)
+# Professor_AI Architecture (v3)
 
-Updated: 2026-03-14
-Incorporates all P0 and P1 findings from consolidated review (`doc/REVIEW.md`).
+Updated: 2026-03-16
+Incorporates security audit findings, performance optimizations, and operational improvements.
 
 ## Overview
 
@@ -114,7 +114,7 @@ graph TD
     cancel -.->|cancel_flag| check
 ```
 
-**Two-thread design**: The main thread runs the mongoose event loop handling all network I/O, parsing, authentication, SSE writes, and health checks. The worker thread runs exactly one inference job at a time. Communication uses a token ring buffer (protected by mutex + condvar) and `mg_wakeup()` to notify the event loop.
+**Two-thread design**: The main thread runs the mongoose event loop handling all network I/O, parsing, authentication, SSE writes, and health checks. The worker thread runs exactly one inference job at a time. Communication uses a token ring buffer (protected by mutex + condvar) and `mg_wakeup()` to notify the event loop. `job->state` is `atomic_int` for safe cross-thread reads without requiring the mutex.
 
 **Why two threads**: Even though only one GPU context exists (concurrent inference is impossible), decoupling inference from the event loop provides:
 
@@ -173,9 +173,11 @@ sequenceDiagram
     loop per token
         W->>L: sample token
         W->>W: write token to ring buffer
-        W->>EV: mg_wakeup
-        EV->>C: data: {"delta":...}
-        W->>W: check cancel/shutdown/timeout
+        W->>W: check cancel/shutdown/timeout (every 32 tokens)
+        Note over W,EV: mg_wakeup batched:<br/>on empty->non-empty or every 8 tokens
+        W->>EV: mg_wakeup (batched)
+        EV->>EV: batch-drain ring (single lock, up to 32 tokens)
+        EV->>C: data: {"delta":...} (direct format, no cJSON)
     end
 
     W->>EV: mg_wakeup (done)
@@ -184,8 +186,9 @@ sequenceDiagram
 
     Note over EV,C: If client disconnects:
     C--xEV: TCP close
-    EV->>W: set job->cancel = 1
+    EV->>W: set job->cancel=1, job->orphaned=1
     W->>W: sees cancel, breaks loop
+    W->>W: frees orphaned job
 ```
 
 ## Request State Machine
@@ -222,11 +225,11 @@ stateDiagram-v2
 
 **Per-token checks in generation loop** (priority order):
 1. `g_shutdown_requested` -> finish_reason = `"abort"`
-2. `job->cancel` (disconnect) -> finish_reason = `"abort"`
-3. elapsed > `max_inference_seconds` -> finish_reason = `"time_limit"`
+2. `cancel_flag` (disconnect) -> finish_reason = `"abort"`
+3. elapsed > `max_inference_seconds` -> finish_reason = `"time_limit"` (checked every 32 tokens)
 4. `llama_decode` return != 0 -> finish_reason = `"backend_error"`
 5. token == EOS -> finish_reason = `"stop"`
-6. stop sequence match -> finish_reason = `"stop"`
+6. stop sequence suffix match (rolling window with pre-computed lengths) -> finish_reason = `"stop"`
 7. `n_generated >= max_tokens` -> finish_reason = `"length"`
 
 ## API Contract
@@ -493,7 +496,7 @@ Two sources, later overrides earlier:
 1. **INI file** (`--config /path/to/file.ini`)
 2. **CLI arguments** (`--model`, `--n-ctx`, `--api-key`, etc.)
 
-CLI is parsed twice: first to extract `--config`, then again after INI loading to override.
+CLI `--config` is extracted with a targeted scan, then the INI file is loaded, then CLI is parsed once to override INI values. This avoids double-parsing which caused accumulating options (like `--allow-ip`) to duplicate.
 
 Default bind address is `127.0.0.1:8080` (loopback). LAN binding requires explicit `listen_addr = 0.0.0.0:8080` in config.
 
@@ -535,7 +538,7 @@ flowchart TD
   - `llama_chat_apply_template` output -- heap buffer sized by first call, freed after tokenization
   - Non-streaming response buffer -- heap with realloc-double, freed after send
   - llama.cpp model/context -- allocated by llama.cpp, freed by `inference_destroy()`
-- **No heap in hot path**: Logger uses stack buffers. Token ring buffer is pre-allocated in `worker_job_t`.
+- **No heap in hot path**: Logger uses stack buffers. Token ring buffer is pre-allocated in `worker_job_t`. SSE streaming uses direct `mg_printf` formatting instead of cJSON allocation per token.
 
 ```mermaid
 graph LR
@@ -575,3 +578,45 @@ cmake -B build -DGGML_HIP=ON -DPROF_USE_SYSTEMD=ON -DCMAKE_BUILD_TYPE=Release
 # Run on LAN
 ./build/professord --model /path/to/model.gguf --listen-addr 0.0.0.0:8080 --api-key mysecretkey
 ```
+
+## Security Measures
+
+- **Constant-time auth**: API key comparison always runs full expected-length loop to prevent timing side-channel attacks on key length.
+- **IP ACL normalization**: IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) are normalized before ACL comparison to prevent bypass.
+- **PID file safety**: Stale PID files are validated (checks if old PID is still running) before overwriting. Uses `O_EXCL` to prevent symlink attacks.
+- **Atomic job state**: `job->state` uses `atomic_int` to prevent data races between worker and event loop threads.
+- **Orphaned job cleanup**: When a client disconnects during inference, the job is marked `orphaned` and freed by the worker thread after inference completes, preventing memory leaks.
+- **Bounds checking**: Log level validated before array indexing. cJSON creation checked for NULL on all serialization paths. Sampler chain checked for NULL after allocation.
+- **Daemon hardening**: Daemonize fails if `/dev/null` cannot be opened instead of silently continuing with inherited file descriptors.
+- **Log routing**: llama.cpp and mongoose output routed through the logger to respect `--log-level` and prevent information leakage at high log levels.
+
+## Performance Architecture
+
+Token generation throughput is memory-bandwidth bound. The `--recommend` flag reports estimated tok/s per model based on detected hardware bandwidth.
+
+**llama.cpp configuration**:
+- `n_threads` auto-detects to `nproc/2` for optimal CPU utilization during prompt processing
+- `n_batch` defaults to 2048 (matching llama.cpp default) for efficient prompt eval
+- KV cache uses q8_0 quantization to halve attention memory bandwidth vs f16
+- Flash attention enabled (auto mode)
+- Performance counters logged per request (prompt tok/s, eval tok/s)
+
+**Streaming hot path** (zero heap allocation per token):
+- Ring buffer uses `memcpy` instead of `snprintf` for token copies
+- `mg_wakeup()` batched to reduce syscalls (empty-to-non-empty transition or every 8 tokens)
+- Ring drain acquires lock once for up to 32 tokens instead of per-token
+- SSE chunks formatted directly via `mg_printf` with `MG_ESC` (no cJSON tree build/serialize/free per token)
+- Timeout checked every 32 tokens instead of every token
+- Stop sequence lengths pre-computed once before generation loop
+
+## Testing
+
+Test suite: `tests/test_all.sh` runs 43 tests across 5 categories and generates timestamped reports in `tests/reports/`.
+
+| Category | Tests | Coverage |
+|----------|-------|----------|
+| Unit tests | 2 | config parsing, API types |
+| Functional | 7 | health, models, routing, auth, error codes |
+| Inference | 4 | chat, completion, streaming, admission control |
+| Stress | 21 | malformed input, numeric edges, method abuse, large payloads, rapid-fire, concurrency, auth edges |
+| Stability | 2 | server alive, final inference after stress |

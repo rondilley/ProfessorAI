@@ -19,7 +19,7 @@ void stats_init(stats_t *st, int32_t report_interval_seconds)
     st->report_interval_seconds = report_interval_seconds;
 }
 
-static double elapsed_since(struct timespec *ref)
+static double elapsed_since(const struct timespec *ref)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -83,7 +83,7 @@ void stats_check_report(stats_t *st, logger_t *lg)
 
 char *stats_to_json(const stats_t *st)
 {
-    double uptime = elapsed_since((struct timespec *)&st->start_time);
+    double uptime = elapsed_since(&st->start_time);
 
     int64_t inferences = atomic_load(&st->inferences_total);
     int64_t tok_in     = atomic_load(&st->tokens_prompt_total);
@@ -93,10 +93,11 @@ char *stats_to_json(const stats_t *st)
     double avg_inf_ms = (inferences > 0) ? (double)inf_ms / (double)inferences : 0.0;
     double avg_tps = (inf_ms > 0) ? (double)tok_out / ((double)inf_ms / 1000.0) : 0.0;
 
-    char *buf = malloc(2048);
+    size_t bufsz = 4096;
+    char *buf = malloc(bufsz);
     if (!buf) return NULL;
 
-    snprintf(buf, 2048,
+    snprintf(buf, bufsz,
         "{"
         "\"uptime_seconds\":%.0f,"
         "\"connections\":{\"total\":%lld,\"active\":%d,\"rejected\":%lld},"
