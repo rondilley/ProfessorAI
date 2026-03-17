@@ -97,6 +97,26 @@ void logger_destroy(logger_t *lg)
     pthread_mutex_destroy(&lg->mutex);
 }
 
+void logger_announce(logger_t *lg, const char *msg)
+{
+    pthread_mutex_lock(&lg->mutex);
+
+    if (lg->use_stderr) {
+        fprintf(stderr, "%s\n", msg);
+    }
+
+    if (lg->use_syslog) {
+        syslog(LOG_NOTICE, "%s", msg);
+    }
+
+    if (lg->log_file) {
+        fprintf(lg->log_file, "%s\n", msg);
+        fflush(lg->log_file);
+    }
+
+    pthread_mutex_unlock(&lg->mutex);
+}
+
 void logger_log(logger_t *lg, log_level_t level, const char *file, int line,
                 const char *fmt, ...)
 {

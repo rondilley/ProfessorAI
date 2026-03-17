@@ -38,6 +38,10 @@ void  logger_log(logger_t *lg, log_level_t level, const char *file, int line,
 /* Call after daemonize to switch from stderr to syslog */
 void  logger_enable_syslog(logger_t *lg);
 
+/* Log a message unconditionally, bypassing the level filter.
+   Used for critical lifecycle messages (e.g., "ready", "shutting down"). */
+void  logger_announce(logger_t *lg, const char *msg);
+
 #define LOG_TRACE(lg, ...) logger_log(lg, LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
 #define LOG_DEBUG(lg, ...) logger_log(lg, LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
 #define LOG_INFO(lg, ...)  logger_log(lg, LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)

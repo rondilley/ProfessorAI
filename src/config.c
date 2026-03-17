@@ -225,9 +225,18 @@ int config_parse_cli(config_t *cfg, int argc, char **argv)
         } else if (strcmp(arg, "--log-file") == 0) {
             set_string(cfg->log_file, sizeof(cfg->log_file), val);
         } else if (strcmp(arg, "--allow-ip") == 0) {
-            if (cfg->acl_count < PROF_ACL_MAX) {
-                snprintf(cfg->acl[cfg->acl_count], PROF_ADDR_MAX, "%s", val);
-                cfg->acl_count++;
+            /* Comma-separated list of IPs, same as INI parser */
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", val);
+            char *saveptr = NULL;
+            char *tok = strtok_r(buf, ",", &saveptr);
+            while (tok && cfg->acl_count < PROF_ACL_MAX) {
+                char *ip = trim(tok);
+                if (ip[0] != '\0') {
+                    snprintf(cfg->acl[cfg->acl_count], PROF_ADDR_MAX, "%s", ip);
+                    cfg->acl_count++;
+                }
+                tok = strtok_r(NULL, ",", &saveptr);
             }
         } else {
             fprintf(stderr, "Unknown option: %s\n", arg);

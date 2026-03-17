@@ -165,7 +165,8 @@ int main(int argc, char **argv)
     LOG_INFO(&lg, "sd_notify: READY=1");
 #endif
 
-    LOG_INFO(&lg, "professord ready");
+    /* Always announce readiness regardless of log level */
+    logger_announce(&lg, "professord ready");
 
     /* 13. Event loop */
     server_run(&mgr, 100);
