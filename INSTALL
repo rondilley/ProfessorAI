@@ -1,0 +1,199 @@
+Build and Installation Instructions for Professor_AI
+=====================================================
+
+Prerequisites
+-------------
+
+Required:
+  - C/C++ compiler with C11 support (GCC 7+ or Clang 5+)
+  - CMake 3.14 or later
+  - Internet connection (for FetchContent to download dependencies)
+    OR local copies of llama.cpp, mongoose, and cJSON
+
+Optional:
+  - ROCm (for AMD GPU acceleration)
+  - CUDA (for NVIDIA GPU acceleration)
+  - libsystemd-dev (for sd_notify readiness signaling)
+
+
+Building
+--------
+
+Standard build with AMD GPU (ROCm):
+
+    cmake -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j$(nproc)
+
+With systemd readiness notification:
+
+    cmake -B build -DGGML_HIP=ON -DPROF_USE_SYSTEMD=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j$(nproc)
+
+CPU-only build:
+
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j$(nproc)
+
+NVIDIA GPU build (CUDA):
+
+    cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j$(nproc)
+
+Debug build with tests:
+
+    cmake -B build -DPROF_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+    cmake --build build -j$(nproc)
+    ctest --test-dir build --output-on-failure
+
+
+Using Local Dependencies
+------------------------
+
+Each dependency can be overridden with a local path instead of
+downloading via FetchContent:
+
+    cmake -B build \
+      -DLOCAL_LLAMA_PATH=/path/to/llama.cpp \
+      -DLOCAL_MONGOOSE_PATH=/path/to/mongoose \
+      -DLOCAL_CJSON_PATH=/path/to/cJSON \
+      -DGGML_HIP=ON
+
+This is useful for air-gapped builds or when working with modified
+versions of a dependency.
+
+
+Installation
+------------
+
+Install to /usr/local/bin (default):
+
+    sudo cmake --install build
+
+Install to a custom prefix:
+
+    cmake -B build -DCMAKE_INSTALL_PREFIX=/opt/professord ...
+    cmake --build build -j$(nproc)
+    sudo cmake --install build
+
+Copy the example config:
+
+    sudo cp etc/professord.ini.example /etc/professord.ini
+    sudo editor /etc/professord.ini    # set model_path at minimum
+
+
+systemd Service
+---------------
+
+The service uses Type=notify -- professord signals readiness after
+the model is fully loaded. This means systemctl start will not return
+until the daemon is actually ready to serve requests (or fails).
+
+1. Create a service user:
+
+    sudo useradd -r -s /usr/sbin/nologin professord
+    sudo usermod -aG video,render professord
+
+2. Install the service file:
+
+    sudo cp etc/professord.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+
+3. Edit the config:
+
+    sudo editor /etc/professord.ini
+
+4. Start the service:
+
+    sudo systemctl enable --now professord
+    sudo systemctl status professord
+    journalctl -u professord -f
+
+
+Verifying the Build
+-------------------
+
+Run unit tests (if built with PROF_BUILD_TESTS=ON):
+
+    ctest --test-dir build --output-on-failure
+
+Check what models are recommended for your hardware:
+
+    ./build/professord --recommend
+
+Smoke test a running instance:
+
+    curl -s http://localhost:8080/health
+
+Quick integration test (requires a running instance with a loaded model):
+
+    bash tests/test_curl.sh [base_url] [api_key]
+
+Full test suite (unit + functional + stress + stability, generates report):
+
+    bash tests/test_all.sh [base_url] [api_key]
+
+Reports are written to tests/reports/report-YYYYMMDD-HHMMSS.md
+
+
+Verifying ROCm Detection
+-------------------------
+
+After configuring with -DGGML_HIP=ON, check the CMake output for:
+
+    -- Found hip
+    -- HIP SDK version: ...
+
+If these lines are absent, ROCm was not detected and llama.cpp will
+build CPU-only. Ensure ROCm is installed and that the HIP compiler
+(hipcc) is in your PATH.
+
+
+Troubleshooting
+---------------
+
+"model_path is required":
+    Set --model on the command line or model_path in the INI file.
+
+Build fails downloading dependencies:
+    Check internet connectivity, or use LOCAL_*_PATH options with
+    locally cloned repositories.
+
+GPU not detected at runtime:
+    Ensure the user running professord is in the video and render
+    groups. Check ROCm/CUDA installation with rocminfo or nvidia-smi.
+
+Port already in use:
+    Change listen_addr in config or via --listen-addr.
+
+401 Unauthorized on all requests:
+    If api_key is set in config, include -H "Authorization: Bearer <key>"
+    in your curl commands. The /health endpoint does not require auth.
+
+503 Server Busy:
+    professord serves one inference at a time. Wait for the current
+    request to complete or time out before sending another.
+
+systemctl start hangs:
+    The service uses Type=notify and waits for the model to load.
+    Large models can take 30+ seconds. Check journalctl for progress.
+
+No log output when daemonized:
+    When running with --daemonize, logs go to syslog, not stderr.
+    View with: journalctl -t professord -f
+    Or use --log-file to write to a file in addition to syslog.
+
+Too much console output:
+    llama.cpp and mongoose debug messages are routed through the logger.
+    Use --log-level 4 (ERROR) for quiet operation, or --log-level 2
+    (INFO) for normal operation. Level 0 (TRACE) shows everything.
+
+Low token throughput:
+    LLM token generation is memory-bandwidth bound. Use --recommend to
+    see estimated tok/s for different model sizes on your hardware.
+    Smaller quantizations (Q3_K_M) and smaller models run faster.
+    Ensure all layers are GPU-offloaded (n_gpu_layers >= model layers).
+
+Performance tuning:
+    --n-threads N    CPU threads for prompt processing (0 = auto)
+    --n-batch N      Batch size for prompt eval (default 2048)
+    n_threads=0 auto-detects to nproc/2 which is optimal for most systems.

@@ -189,7 +189,8 @@ int config_parse_cli(config_t *cfg, int argc, char **argv)
             set_string(cfg->model_path, sizeof(cfg->model_path), val);
         } else if (strcmp(arg, "--model-alias") == 0) {
             set_string(cfg->model_alias, sizeof(cfg->model_alias), val);
-        } else if (strcmp(arg, "--n-ctx") == 0) {
+        } else if (strcmp(arg, "--n-ctx") == 0 ||
+                   strcmp(arg, "--fing-longer") == 0) {
             cfg->n_ctx = (int32_t)strtol(val, NULL, 10);
         } else if (strcmp(arg, "--n-gpu-layers") == 0) {
             cfg->n_gpu_layers = (int32_t)strtol(val, NULL, 10);
@@ -301,5 +302,6 @@ void config_print_help(const char *prog)
     printf("  --stats-interval N         Seconds between stats log [60] (0=off)\n");
     printf("  --gen-api-key              Generate a random API key and exit\n");
     printf("  --recommend                Detect hardware, recommend models\n");
+    printf("  --version                  Show version and exit\n");
     printf("  --help                     Show this help\n");
 }

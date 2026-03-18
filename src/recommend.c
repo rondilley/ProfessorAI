@@ -302,6 +302,7 @@ int hw_detect(hw_info_t *hw)
 
 void hw_print_summary(const hw_info_t *hw)
 {
+    printf("  Good news, everyone! I've analyzed your hardware.\n\n");
     printf("=== System Hardware ===\n\n");
 
     printf("  CPU:          %s\n", hw->cpu_model);
@@ -352,31 +353,42 @@ typedef struct {
     const char *name;
     const char *quant;
     double      size_gb;
+    int32_t     max_ctx;          /* model's native max context length */
+    int32_t     kv_bytes_per_tok; /* Q8_0 KV cache bytes per context token */
     const char *notes;
 } model_entry_t;
 
+/* KV cache bytes per token (Q8_0) for common architectures:
+   Llama 3.x  8B: 32 layers * 2 * 8 KV heads * 128 d_head =  65,536
+   Llama 3.x 70B: 80 layers * 2 * 8 KV heads * 128 d_head = 163,840
+   Qwen2.5   14B: 48 layers * 2 * 8 KV heads * 128 d_head =  98,304
+   Qwen2.5   32B: 64 layers * 2 * 8 KV heads * 128 d_head = 131,072
+   Qwen2.5   72B: 80 layers * 2 * 8 KV heads * 128 d_head = 163,840
+   Phi-4     14B: 40 layers * 2 * 10 KV heads * 96 d_head  =  76,800
+   Mistral Large: 88 layers * 2 * 8 KV heads * 128 d_head  = 180,224 */
+
 static const model_entry_t hermes_models[] = {
-    { "Hermes-3-Llama-3.1-8B",  "Q4_K_M",  4.9, "Fast, good quality"        },
-    { "Hermes-3-Llama-3.1-8B",  "Q6_K",    6.6, "Higher quality"            },
-    { "Hermes-3-Llama-3.1-8B",  "Q8_0",    8.5, "Near-lossless 8B"          },
-    { "Hermes-3-Llama-3.1-8B",  "F16",    16.0, "Full precision 8B"         },
-    { "Hermes-3-Llama-3.1-70B", "Q3_K_M", 33.0, "Aggressive quant, usable" },
-    { "Hermes-3-Llama-3.1-70B", "Q4_K_M", 40.0, "Best balance for 70B"     },
-    { "Hermes-3-Llama-3.1-70B", "Q5_K_M", 50.0, "High quality 70B"         },
-    { "Hermes-3-Llama-3.1-70B", "Q6_K",   58.0, "Very high quality 70B"    },
-    { "Hermes-3-Llama-3.1-70B", "Q8_0",   74.0, "Near-lossless 70B"        },
-    { NULL, NULL, 0, NULL }
+    { "Hermes-3-Llama-3.1-8B",  "Q4_K_M",  4.9, 131072,  65536, "Fast, good quality"        },
+    { "Hermes-3-Llama-3.1-8B",  "Q6_K",    6.6, 131072,  65536, "Higher quality"            },
+    { "Hermes-3-Llama-3.1-8B",  "Q8_0",    8.5, 131072,  65536, "Near-lossless 8B"          },
+    { "Hermes-3-Llama-3.1-8B",  "F16",    16.0, 131072,  65536, "Full precision 8B"         },
+    { "Hermes-3-Llama-3.1-70B", "Q3_K_M", 33.0, 131072, 163840, "Aggressive quant, usable" },
+    { "Hermes-3-Llama-3.1-70B", "Q4_K_M", 40.0, 131072, 163840, "Best balance for 70B"     },
+    { "Hermes-3-Llama-3.1-70B", "Q5_K_M", 50.0, 131072, 163840, "High quality 70B"         },
+    { "Hermes-3-Llama-3.1-70B", "Q6_K",   58.0, 131072, 163840, "Very high quality 70B"    },
+    { "Hermes-3-Llama-3.1-70B", "Q8_0",   74.0, 131072, 163840, "Near-lossless 70B"        },
+    { NULL, NULL, 0, 0, 0, NULL }
 };
 
 static const model_entry_t other_models[] = {
-    { "Qwen2.5-72B-Instruct",     "Q4_K_M", 42.0, "Strong multilingual"  },
-    { "Qwen2.5-32B-Instruct",     "Q6_K",   25.0, "Good mid-size option" },
-    { "Qwen2.5-14B-Instruct",     "Q8_0",   15.0, "Fast and capable"     },
-    { "Llama-3.3-70B-Instruct",   "Q4_K_M", 40.0, "Meta's latest 70B"   },
-    { "Mistral-Large-2411",        "Q4_K_M", 38.0, "Strong reasoning"    },
-    { "DeepSeek-R1-Distill-70B",  "Q4_K_M", 40.0, "Reasoning focused"   },
-    { "Phi-4-14B",                 "Q8_0",   15.0, "Microsoft, fast"     },
-    { NULL, NULL, 0, NULL }
+    { "Qwen2.5-72B-Instruct",     "Q4_K_M", 42.0, 131072, 163840, "Strong multilingual"  },
+    { "Qwen2.5-32B-Instruct",     "Q6_K",   25.0, 131072, 131072, "Good mid-size option" },
+    { "Qwen2.5-14B-Instruct",     "Q8_0",   15.0, 131072,  98304, "Fast and capable"     },
+    { "Llama-3.3-70B-Instruct",   "Q4_K_M", 40.0, 131072, 163840, "Meta's latest 70B"   },
+    { "Mistral-Large-2411",        "Q4_K_M", 38.0,  32768, 180224, "Strong reasoning"    },
+    { "DeepSeek-R1-Distill-70B",  "Q4_K_M", 40.0, 131072, 163840, "Reasoning focused"   },
+    { "Phi-4-14B",                 "Q8_0",   15.0,  16384,  76800, "Microsoft, fast"     },
+    { NULL, NULL, 0, 0, 0, NULL }
 };
 
 /* Estimate tok/s for a model given memory bandwidth.
@@ -450,7 +462,7 @@ static void print_model_table(const model_entry_t *models, int64_t budget_gb,
     printf("  * = recommended for your hardware\n");
     if (show_tps) {
         printf("  tok/s estimates assume full GPU offload (model fits in GPU memory)\n");
-        printf("  Models marked 'Spill' run partially on CPU and are much slower\n");
+        printf("  Models marked 'Spill': To shreds, you say? (runs partially on CPU)\n");
     }
     printf("\n");
 }
@@ -470,7 +482,8 @@ void hw_print_recommendations(const hw_info_t *hw)
         model_budget_gb = (int64_t)((double)budget_gb * 0.85);
     }
 
-    printf("=== Model Recommendations ===\n\n");
+    printf("=== Model Recommendations ===\n");
+    printf("  \"I suppose I could part with one recommendation and still be feared.\"\n\n");
     printf("  GPU memory budget: %lld GB", (long long)budget_gb);
     if (hw->is_uma) {
         printf(" (UMA -- shared with system)");
@@ -504,7 +517,8 @@ void hw_print_recommendations(const hw_info_t *hw)
         best = &hermes_models[0];
     }
 
-    printf("  === Top Pick ===\n\n");
+    printf("  === Top Pick ===\n");
+    printf("  \"Good news, everyone!\"\n\n");
     printf("  %s %s (%.0f GB)\n", best->name, best->quant, best->size_gb);
     if (hw->mem_bandwidth_gbps > 0) {
         double tps = estimate_tps(best->size_gb, hw->mem_bandwidth_gbps);
@@ -512,12 +526,82 @@ void hw_print_recommendations(const hw_info_t *hw)
     }
     printf("  Best balance of quality and speed for your hardware.\n\n");
 
+    /* Context size recommendation */
+    int32_t recommended_ctx = 4096;
+    {
+        double remaining_gb = (double)model_budget_gb - best->size_gb;
+        if (remaining_gb < 0.5) remaining_gb = 0.5;
+
+        printf("  === Recommended --n-ctx ===\n\n");
+        printf("  Memory remaining after model load: ~%.1f GB\n", remaining_gb);
+        printf("  KV cache (Q8_0): %.0f KB per 1K context tokens\n\n",
+               (double)best->kv_bytes_per_tok * 1024.0 / (1024.0 * 1024.0));
+
+        /* Show n_ctx options from 4096 to model max */
+        int32_t ctx_options[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
+        int n_opts = (int)(sizeof(ctx_options) / sizeof(ctx_options[0]));
+        printf("  %-10s %10s  %-6s  %s\n",
+               "--n-ctx", "KV cache", "Fit", "Use case");
+        printf("  %-10s %10s  %-6s  %s\n",
+               "----------", "----------", "------",
+               "------------------------------");
+
+        for (int i = 0; i < n_opts; i++) {
+            int32_t ctx = ctx_options[i];
+            if (ctx > best->max_ctx) break;
+
+            double kv_gb = (double)best->kv_bytes_per_tok * (double)ctx /
+                           (1024.0 * 1024.0 * 1024.0);
+            const char *fit;
+            const char *usecase;
+
+            if (kv_gb <= remaining_gb * 0.5) {
+                fit = "Easy";
+                recommended_ctx = ctx;
+            } else if (kv_gb <= remaining_gb * 0.85) {
+                fit = "Good";
+                recommended_ctx = ctx;
+            } else if (kv_gb <= remaining_gb) {
+                fit = "Tight";
+            } else {
+                fit = "No";
+            }
+
+            if (ctx <= 4096) {
+                usecase = "Basic chat";
+            } else if (ctx <= 8192) {
+                usecase = "Chat + small tool sets";
+            } else if (ctx <= 16384) {
+                usecase = "Agents, tool calling (recommended)";
+            } else if (ctx <= 32768) {
+                usecase = "Many tools, long conversations";
+            } else {
+                usecase = "Long documents, RAG";
+            }
+
+            printf("  %-10d %8.1f GB  %-6s  %s\n", ctx, kv_gb, fit, usecase);
+        }
+
+        printf("\n  Recommended: --n-ctx %d\n", recommended_ctx);
+        if (recommended_ctx < 8192) {
+            printf("  Warning: contexts below 8192 may be too small for tool-calling\n");
+            printf("  agents (e.g., Hermes). Consider a smaller model to free memory.\n");
+        }
+        printf("\n");
+    }
+
     printf("  Download from Hugging Face:\n");
     printf("  huggingface-cli download NousResearch/%s-GGUF %s.%s.gguf\n\n",
            best->name, best->name, best->quant);
 
+    printf("  Example launch:\n");
+    printf("  professord --model %s.%s.gguf --n-ctx %d --n-gpu-layers 999\n\n",
+           best->name, best->quant, recommended_ctx);
+    printf("  Now go! And don't come back until you've generated at least one token!\n\n");
+
     if (hw->is_uma) {
         printf("  Note: This is a UMA/APU system. The GPU shares system RAM.\n");
+        printf("  \"Our crew is replaceable, your package isn't.\"\n");
         printf("  Models fitting in GTT (%.0f GB) get full GPU acceleration.\n",
                (double)hw->gtt_bytes / GB);
         printf("  Larger models spill to CPU RAM and run slower.\n\n");
@@ -530,7 +614,8 @@ void hw_print_recommendations(const hw_info_t *hw)
     }
 
     if (hw->mem_bandwidth_gbps > 0) {
-        printf("  === Performance Notes ===\n\n");
+        printf("  === Performance Notes ===\n");
+        printf("  \"Now I don't say this often, but this is actually important.\"\n\n");
         printf("  LLM token generation is memory-bandwidth bound. Each token\n");
         printf("  requires reading the full model weights from memory once.\n\n");
         printf("  Formula: tok/s ~ memory_bandwidth / model_size\n");

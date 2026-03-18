@@ -56,7 +56,7 @@ void stats_report(stats_t *st, logger_t *lg)
     int uptime_s = (int)(uptime) % 60;
 
     LOG_INFO(lg,
-        "[stats] uptime=%dh%02dm%02ds "
+        "[Planet Express status report] uptime=%dh%02dm%02ds "
         "conns=%lld/%d/%lld "
         "reqs=%lld errs=%lld "
         "inferences=%lld tok_in=%lld tok_out=%lld "

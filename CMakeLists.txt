@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(professord C CXX)
+project(professord VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -70,6 +70,12 @@ target_include_directories(professord PRIVATE
     src
     ${llama_cpp_SOURCE_DIR}/include
     ${cjson_SOURCE_DIR})
+
+target_compile_definitions(professord PRIVATE
+    PROF_VERSION="${PROJECT_VERSION}"
+    PROF_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    PROF_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    PROF_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 
 target_link_libraries(professord PRIVATE
     llama ggml mongoose cjson pthread m)

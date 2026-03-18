@@ -127,14 +127,14 @@ int inference_init(inference_engine_t *eng, const config_t *cfg, logger_t *lg)
 
     llama_backend_init();
 
-    LOG_INFO(lg, "loading model: %s", cfg->model_path);
+    LOG_INFO(lg, "Now hold on, let me just load this model... %s", cfg->model_path);
 
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = cfg->n_gpu_layers;
 
     eng->model = llama_model_load_from_file(cfg->model_path, mparams);
     if (!eng->model) {
-        LOG_FATAL(lg, "failed to load model: %s", cfg->model_path);
+        LOG_FATAL(lg, "Bad news, nobody. The model failed to load: %s", cfg->model_path);
         llama_backend_free();
         return -1;
     }
@@ -181,7 +181,8 @@ int inference_init(inference_engine_t *eng, const config_t *cfg, logger_t *lg)
         LOG_WARN(lg, "model has no chat template, using ChatML fallback");
     }
 
-    LOG_INFO(lg, "model loaded: n_ctx=%d, n_gpu_layers=%d, n_batch=%d, n_threads=%d",
+    LOG_INFO(lg, "Good news, everyone! I've loaded the model! "
+             "n_ctx=%d, n_gpu_layers=%d, n_batch=%d, n_threads=%d",
              cfg->n_ctx, cfg->n_gpu_layers, cfg->n_batch, n_threads);
 
     /* Dump per-device memory breakdown so we can verify full GPU offload */
@@ -217,29 +218,42 @@ int inference_complete(inference_engine_t *eng, const char *prompt,
     /* Clear KV cache */
     llama_memory_clear(llama_get_memory(eng->ctx), true);
 
-    /* Tokenize */
-    int32_t n_prompt_max = eng->n_ctx;
-    llama_token *tokens = malloc(sizeof(llama_token) * (size_t)n_prompt_max);
+    /* Tokenize -- first call with NULL to get required token count */
+    int32_t prompt_len = (int32_t)strlen(prompt);
+    int32_t n_required = llama_tokenize(eng->vocab, prompt, prompt_len,
+                                         NULL, 0, false, true);
+    /* llama_tokenize returns -nTokens when buffer is too small */
+    if (n_required == 0) {
+        LOG_ERROR(eng->logger, "tokenization failed: empty prompt (%d bytes)",
+                  prompt_len);
+        snprintf(finish_reason, fr_len, "%s", "backend_error");
+        return -1;
+    }
+
+    int32_t n_tokens = (n_required < 0) ? -n_required : n_required;
+
+    /* Context overflow check (before allocating) */
+    if (n_tokens >= eng->n_ctx) {
+        LOG_WARN(eng->logger, "Sweet zombie Jesus! That prompt is longer than "
+                 "my list of doomsday devices: %d tokens >= n_ctx %d "
+                 "(prompt %d bytes)", n_tokens, eng->n_ctx, prompt_len);
+        snprintf(finish_reason, fr_len, "%s", "context_overflow");
+        return -1;
+    }
+
+    llama_token *tokens = malloc(sizeof(llama_token) * (size_t)n_tokens);
     if (!tokens) {
         snprintf(finish_reason, fr_len, "%s", "backend_error");
         return -1;
     }
 
-    int32_t n_prompt = llama_tokenize(eng->vocab, prompt, (int32_t)strlen(prompt),
-                                       tokens, n_prompt_max, false, true);
+    int32_t n_prompt = llama_tokenize(eng->vocab, prompt, prompt_len,
+                                       tokens, n_tokens, false, true);
     if (n_prompt < 0) {
-        LOG_ERROR(eng->logger, "tokenization failed");
+        LOG_ERROR(eng->logger, "tokenization failed: prompt %d bytes, "
+                  "expected %d tokens", prompt_len, n_tokens);
         free(tokens);
         snprintf(finish_reason, fr_len, "%s", "backend_error");
-        return -1;
-    }
-
-    /* Context overflow check */
-    if (n_prompt >= eng->n_ctx) {
-        LOG_WARN(eng->logger, "prompt too long: %d tokens >= n_ctx %d",
-                 n_prompt, eng->n_ctx);
-        free(tokens);
-        snprintf(finish_reason, fr_len, "%s", "context_overflow");
         return -1;
     }
 

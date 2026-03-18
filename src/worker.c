@@ -261,7 +261,13 @@ static void *worker_thread_func(void *arg)
 
         atomic_store(&job->state, (rc == 0) ? JOB_STATE_DONE : JOB_STATE_ERROR);
 
-        LOG_INFO(w->logger, "inference done: prompt=%d comp=%d finish=%s",
+        /* Easter egg: doomsday model */
+        if (rc == 0 && strstr(job->model_id, "doomsday") != NULL) {
+            LOG_INFO(w->logger,
+                     "I suppose I could part with one and still be feared.");
+        }
+
+        LOG_INFO(w->logger, "Delivery complete! prompt=%d comp=%d finish=%s",
                  job->prompt_tokens, job->completion_tokens, job->finish_reason);
 
         /* Clear current_job BEFORE wakeup so the worker doesn't re-enter */

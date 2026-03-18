@@ -33,6 +33,21 @@ void run_recommend(void)
 #include <systemd/sd-daemon.h>
 #endif
 
+#ifndef PROF_VERSION
+#define PROF_VERSION "0.1.0"
+#endif
+
+static void print_banner(logger_t *lg)
+{
+    LOG_INFO(lg, "%s", "");
+    LOG_INFO(lg, "  ======================================================");
+    LOG_INFO(lg, "    professord v%s -- Planet Express Inference Division",
+             PROF_VERSION);
+    LOG_INFO(lg, "    \"Our crew is replaceable, your package isn't.\"");
+    LOG_INFO(lg, "  ======================================================");
+    LOG_INFO(lg, "%s", "");
+}
+
 int main(int argc, char **argv)
 {
     config_t           cfg;
@@ -48,6 +63,10 @@ int main(int argc, char **argv)
 
     /* 2. Check for early-exit flags (before config validation) */
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("professord v%s\n", PROF_VERSION);
+            return 0;
+        }
         if (strcmp(argv[i], "--recommend") == 0) {
             run_recommend();
             return 0;
@@ -102,7 +121,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    LOG_INFO(&lg, "professord starting");
+    print_banner(&lg);
+    LOG_INFO(&lg, "Good news, everyone! professord is starting up!");
 
     /* 7. Install signal handlers */
     daemon_install_signals();
@@ -166,13 +186,13 @@ int main(int argc, char **argv)
 #endif
 
     /* Always announce readiness regardless of log level */
-    logger_announce(&lg, "professord ready");
+    logger_announce(&lg, "Good news, everyone! professord is ready!");
 
     /* 13. Event loop */
     server_run(&mgr, 100);
 
     /* 14. Cleanup */
-    LOG_INFO(&lg, "shutting down");
+    LOG_INFO(&lg, "I don't want to live on this planet anymore. Shutting down.");
 
     server_destroy(&mgr);
     worker_cancel(&worker);
@@ -183,7 +203,8 @@ int main(int argc, char **argv)
         daemon_remove_pidfile(cfg.pid_file);
     }
 
-    LOG_INFO(&lg, "shutdown complete");
+    LOG_INFO(&lg, "So that's what things would be like if I'd shut down. "
+             "A man can dream though. A man can dream...");
     logger_destroy(&lg);
 
     return 0;

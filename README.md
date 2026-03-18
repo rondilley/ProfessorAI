@@ -1,5 +1,7 @@
 # Professor_AI
 
+**Current version: v0.1.0**
+
 A Unix daemon (`professord`) that wraps [llama.cpp](https://github.com/ggml-org/llama.cpp) to serve a local LLM via an OpenAI-compatible REST API. Written in pure C (C11).
 
 Designed for a single-GPU host (AMD ROCm) serving one primary client (Hermes on Jetson Orin Nano) over LAN.
@@ -14,7 +16,7 @@ Designed for a single-GPU host (AMD ROCm) serving one primary client (Hermes on 
 - Admission control (503 when busy)
 - Per-token cancellation on disconnect, shutdown, or timeout
 - Runtime stats endpoint (`/v1/stats`) and periodic log reporting
-- Hardware detection and model recommendations with estimated tok/s (`--recommend`)
+- Hardware detection, model recommendations with estimated tok/s, and `--n-ctx` sizing (`--recommend`)
 - INI config file + CLI argument overrides
 - Optional daemonization with syslog logging
 - systemd `Type=notify` with readiness signaling
@@ -25,6 +27,9 @@ Designed for a single-GPU host (AMD ROCm) serving one primary client (Hermes on 
 # Build (auto-downloads dependencies, ROCm GPU acceleration)
 cmake -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+
+# Check version
+./build/professord --version
 
 # See what models are recommended for your hardware
 ./build/professord --recommend
@@ -80,10 +85,11 @@ See [etc/professord.ini.example](etc/professord.ini.example) for all options.
 | `--max-tokens N` | 512 | Default max tokens per response |
 | `--listen-addr ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `--api-key KEY` | (none) | Bearer token for auth (empty = no auth) |
-| `--allow-ip IP` | (none) | Add IP to ACL (repeatable; empty = allow all) |
+| `--allow-ip IP[,IP,...]` | (none) | Add IP(s) to ACL (comma-separated and/or repeatable; empty = allow all) |
 | `--max-inference-seconds N` | 300 | Wall-clock timeout per generation |
 | `--stats-interval N` | 60 | Seconds between stats log reports (0 = off) |
-| `--recommend` | | Detect hardware, recommend models, and exit |
+| `--recommend` | | Detect hardware, recommend models and `--n-ctx`, and exit |
+| `--version` / `-v` | | Print version and exit |
 | `--daemonize` | off | Run as daemon (logs switch to syslog) |
 | `--pid-file PATH` | `/run/professord/professord.pid` | PID file path |
 | `--log-level N` | 2 (INFO) | 0=TRACE 1=DEBUG 2=INFO 3=WARN 4=ERROR 5=FATAL |
@@ -123,8 +129,8 @@ Create `/etc/professord.ini` on the workstation:
 model_path = /path/to/Hermes-3-Llama-3.1-70B-Q4_K_M.gguf
 model_alias = hermes-70b
 
-# Context -- match Hermes expectations
-n_ctx = 8192
+# Context -- size for tool-calling agents (see --recommend)
+n_ctx = 16384
 n_gpu_layers = 99
 max_tokens = 2048
 
@@ -294,7 +300,11 @@ Authorization: Bearer <api-key>
 
 ### GET /health
 
-Returns `{"status": "ok"}` if the server is running. No auth required.
+Returns server status and version. No auth required.
+
+```json
+{"status": "ok", "version": "0.1.0"}
+```
 
 ### GET /v1/stats
 
@@ -338,7 +348,7 @@ OpenAI-compatible chat completion.
 }
 ```
 
-**Constraints:** max 64 messages, roles must be `system`/`user`/`assistant`, `max_tokens` capped to available context.
+**Constraints:** max 64 messages, max 64 KiB per message content, roles must be `system`/`user`/`assistant`, `max_tokens` capped to available context.
 
 **Response:**
 ```json
@@ -393,15 +403,24 @@ Reports are written to `tests/reports/report-YYYYMMDD-HHMMSS.md`.
 
 ## Performance
 
-Token generation throughput is memory-bandwidth bound. Use `--recommend` to see estimated tok/s for different model sizes on your hardware.
+Token generation throughput is memory-bandwidth bound. Use `--recommend` to see estimated tok/s for different model sizes on your hardware, along with recommended `--n-ctx` settings and their memory costs.
 
 Key configuration for performance:
+- `--n-ctx` should be sized to your use case (see `--recommend` output for guidance). Tool-calling agents like Hermes need at least 8192; 16384+ recommended for many tools.
 - `--n-threads 0` (default) auto-detects optimal thread count
 - `--n-batch 2048` (default) for fast prompt processing
 - KV cache uses q8_0 quantization to reduce attention bandwidth
 - Flash attention enabled automatically when supported
 
 llama.cpp performance counters are logged per request at INFO level (prompt tok/s, eval tok/s).
+
+## Versioning
+
+The version is set in `CMakeLists.txt` via `project(professord VERSION X.Y.Z ...)` and propagated as compile definitions (`PROF_VERSION`, `PROF_VERSION_MAJOR`, `PROF_VERSION_MINOR`, `PROF_VERSION_PATCH`). It appears in:
+
+- `professord --version` CLI output
+- Startup banner log
+- `/health` endpoint JSON response (`"version"` field)
 
 ## Architecture
 

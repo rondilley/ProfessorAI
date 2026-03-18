@@ -13,7 +13,7 @@
 
 #define PROF_MODEL_MAX   128
 #define PROF_ROLE_MAX    32
-#define PROF_CONTENT_MAX 16384   /* 16 KiB per message */
+#define PROF_CONTENT_MAX 65536   /* 64 KiB per message */
 #define PROF_STOP_MAX    4
 #define PROF_STOP_LEN    64
 #define PROF_ID_MAX      64

@@ -17,6 +17,35 @@ static int  ring_read(token_ring_t *r, char *out, size_t out_len);
 static int  ring_is_empty_unlocked(const token_ring_t *r);
 static void drain_stream_ring(struct mg_connection *c, server_ctx_t *sctx);
 
+/* Professor Farnsworth quotes for the What-If Machine */
+static const char *farnsworth_quotes[] = {
+    "Good news, everyone! I've taught the toaster to feel love.",
+    "I don't want to live on this planet anymore.",
+    "Sweet zombie Jesus!",
+    "There's no scientific consensus that life is important.",
+    "To shreds, you say?",
+    "I suppose I could part with one and still be feared.",
+    "If a dog craps anywhere in the universe, you can bet I won't be out of the loop.",
+    "Quiet, you!",
+    "Now I've often said 'good news' when sending you on a mission of extreme danger.",
+    "Good news, everyone! I'm still technically alive!",
+    "Bad news, nobody.",
+    "My God, they're back! We're doomed!",
+    "Wernstrom!",
+    "So that's what things would be like if I'd invented the Fing-Longer. "
+        "A man can dream though. A man can dream...",
+    "Good news, everyone! Several years ago I tried to log on to AOL, "
+        "and it just went through! We're online!",
+    "Our crew is replaceable, your package isn't.",
+    "Fuff!",
+    "Eh wha?",
+    "Oh my, yes.",
+    "Planet Express is on the move. For this hip, young delivery company, "
+        "tomorrow is today and today is yesterday."
+};
+#define FARNSWORTH_QUOTE_COUNT \
+    (int)(sizeof(farnsworth_quotes) / sizeof(farnsworth_quotes[0]))
+
 /* Per-connection data for tracking active jobs */
 typedef struct {
     worker_job_t *job;
@@ -54,6 +83,30 @@ static void send_error(struct mg_connection *c, int http_status,
             default:  atomic_fetch_add(&sctx->stats->err_500, 1); break;
         }
     }
+
+    /* Professor Farnsworth commentary (log only, not in API response) */
+    if (sctx && sctx->lg) {
+        switch (http_status) {
+            case 400:
+                LOG_DEBUG(sctx->lg, "Wernstrom! That request makes no sense.");
+                break;
+            case 404:
+                LOG_DEBUG(sctx->lg, "Eh wha? I don't seem to have that endpoint.");
+                break;
+            case 405:
+                LOG_DEBUG(sctx->lg, "You can't just DO that to my API!");
+                break;
+            case 500:
+                LOG_WARN(sctx->lg, "My God, we're doomed!");
+                break;
+            case 503:
+                LOG_DEBUG(sctx->lg, "Quiet, you! I'm doing science.");
+                break;
+            default:
+                break;
+        }
+    }
+
     char *json = error_to_json(http_status, message, type);
     if (json) {
         send_json_response(c, http_status, json);
@@ -113,11 +166,40 @@ static void log_access(logger_t *lg, struct mg_connection *c,
     }
 }
 
+#ifndef PROF_VERSION
+#define PROF_VERSION "0.1.0"
+#endif
+
 static void handle_health(struct mg_connection *c, server_ctx_t *sctx)
 {
     if (sctx->stats) atomic_fetch_add(&sctx->stats->req_health, 1);
     mg_http_reply(c, 200, "Content-Type: application/json\r\n",
-                  "{\"status\":\"ok\"}");
+                  "{\"status\":\"ok\",\"version\":\"%s\"}", PROF_VERSION);
+}
+
+static void handle_whatif(struct mg_connection *c)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int idx = (int)((ts.tv_nsec / 1000) % FARNSWORTH_QUOTE_COUNT);
+    const char *quote = farnsworth_quotes[idx];
+
+    /* Escape JSON string */
+    size_t qlen = strlen(quote);
+    char escaped[1024];
+    size_t pos = 0;
+    for (size_t i = 0; i < qlen && pos < sizeof(escaped) - 2; i++) {
+        if (quote[i] == '"' || quote[i] == '\\') {
+            escaped[pos++] = '\\';
+        }
+        escaped[pos++] = quote[i];
+    }
+    escaped[pos] = '\0';
+
+    char buf[1280];
+    snprintf(buf, sizeof(buf),
+             "{\"what_if\":\"%s\",\"source\":\"Professor Farnsworth\"}", escaped);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", buf);
 }
 
 static void handle_stats(struct mg_connection *c, server_ctx_t *sctx)
@@ -468,23 +550,36 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 
         int is_health = (mg_match(hm->uri, mg_str("/health"), NULL) ||
                          mg_match(hm->uri, mg_str("/v1/health"), NULL));
+        int is_whatif = mg_match(hm->uri, mg_str("/whatif"), NULL);
 
         /* Body size check */
         if (hm->body.len > PROF_MAX_BODY_BYTES) {
+            LOG_WARN(sctx->lg,
+                     "Sweet three-toed sloth of ice planet Hoth! "
+                     "Request body too large (%lu bytes)",
+                     (unsigned long)hm->body.len);
             send_error(c, 400, "Request body too large", "invalid_request");
             return;
         }
 
-        /* Auth check (skip for health) */
-        if (!is_health) {
+        /* Auth check (skip for health and whatif) */
+        if (!is_health && !is_whatif) {
             if (check_auth(hm, sctx->cfg) != 0) {
+                char auth_ip[48];
+                mg_snprintf(auth_ip, sizeof(auth_ip), "%M", mg_print_ip, &c->rem);
+                LOG_WARN(sctx->lg,
+                         "Sweet zombie Jesus! Unauthorized access attempt from %s",
+                         auth_ip);
                 send_error(c, 401, "Invalid or missing API key", "unauthorized");
                 return;
             }
         }
 
         /* Route dispatch with method checking */
-        if (is_health) {
+        if (is_whatif) {
+            handle_whatif(c);
+        }
+        else if (is_health) {
             handle_health(c, sctx);
         }
         else if (mg_match(hm->uri, mg_str("/v1/stats"), NULL)) {
@@ -547,7 +642,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
             if (!allowed) {
                 /* Silent drop -- no HTTP response, no data, just close */
                 if (sctx->stats) atomic_fetch_add(&sctx->stats->connections_rejected, 1);
-                LOG_DEBUG(sctx->lg, "ACL rejected connection from %s", ip);
+                LOG_DEBUG(sctx->lg,
+                         "You're not on the list. Good day, sir! "
+                         "(rejected %s)", ip);
                 c->is_closing = 1;
                 return;
             }
@@ -560,8 +657,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
         }
         if (sctx->active_connections > PROF_MAX_CONNECTIONS) {
             if (sctx->stats) atomic_fetch_add(&sctx->stats->connections_rejected, 1);
-            LOG_WARN(sctx->lg, "connection limit reached (%d), dropping",
-                     sctx->active_connections);
+            LOG_WARN(sctx->lg,
+                     "Sweet llamas of the Bahamas! Connection limit "
+                     "reached (%d), dropping", sctx->active_connections);
             c->is_closing = 1;
         }
     }
